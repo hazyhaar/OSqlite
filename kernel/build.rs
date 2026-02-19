@@ -3,6 +3,15 @@
 /// Compiles the SQLite 3.51.2 amalgamation + bare-metal stubs + setjmp asm
 /// as a static C library linked into the kernel.
 fn main() {
+    // Skip C compilation when building for the host target (unit tests).
+    // The storage unit tests only exercise pure Rust bitmap/file-table logic
+    // and don't need SQLite, the bare-metal stubs, or the kernel code model.
+    let target = std::env::var("TARGET").unwrap_or_default();
+    if !target.contains("heavenos") {
+        // Host target (e.g., x86_64-unknown-linux-gnu) — skip bare-metal C code.
+        return;
+    }
+
     // Common flags for bare-metal x86_64 kernel code.
     // -fno-pic is critical: the cc crate may default to PIC, but
     // -mcmodel=kernel requires non-PIC code.

@@ -6,8 +6,9 @@
 /// This is NOT a general-purpose filesystem. It maps a small number of
 /// well-known names (main.db, main.db-wal, main.db-shm, main.db-journal,
 /// temp files) to contiguous block allocations on disk.
-use crate::drivers::nvme::{NvmeDriver, NvmeError};
+use crate::drivers::nvme::NvmeError;
 use crate::mem::DmaBuf;
+use super::block_device::BlockDevice;
 
 /// Maximum file name length (including null terminator).
 const MAX_NAME_LEN: usize = 64;
@@ -94,13 +95,13 @@ impl FileTable {
 
     /// Load the file table from disk.
     pub fn load(
-        nvme: &mut NvmeDriver,
+        dev: &mut dyn BlockDevice,
         file_table_lba: u64,
         block_size: u32,
     ) -> Result<Self, NvmeError> {
         let mut buf = DmaBuf::alloc(block_size as usize)
             .map_err(|_| NvmeError::OutOfMemory)?;
-        nvme.read_blocks(file_table_lba, 1, &mut buf)?;
+        dev.read_blocks(file_table_lba, 1, &mut buf)?;
 
         let mut table = Self::new(file_table_lba, block_size);
         let data = buf.as_slice();
@@ -120,7 +121,7 @@ impl FileTable {
     }
 
     /// Flush the file table to disk if dirty.
-    pub fn flush(&mut self, nvme: &mut NvmeDriver) -> Result<(), NvmeError> {
+    pub fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<(), NvmeError> {
         if !self.dirty {
             return Ok(());
         }
@@ -142,7 +143,7 @@ impl FileTable {
             }
         }
 
-        nvme.write_blocks(self.file_table_lba, 1, &buf)?;
+        dev.write_blocks(self.file_table_lba, 1, &buf)?;
         self.dirty = false;
         Ok(())
     }

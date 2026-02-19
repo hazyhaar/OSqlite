@@ -396,3 +396,27 @@ impl NvmeDriver {
 
 /// Global NVMe driver instance (initialized during boot).
 pub static NVME: Mutex<Option<NvmeDriver>> = Mutex::new(None);
+
+// ---- BlockDevice trait impl ----
+
+impl crate::storage::block_device::BlockDevice for NvmeDriver {
+    fn read_blocks(&mut self, lba: u64, block_count: u16, buf: &mut DmaBuf) -> Result<(), NvmeError> {
+        NvmeDriver::read_blocks(self, lba, block_count, buf)
+    }
+
+    fn write_blocks(&mut self, lba: u64, block_count: u16, buf: &DmaBuf) -> Result<(), NvmeError> {
+        NvmeDriver::write_blocks(self, lba, block_count, buf)
+    }
+
+    fn flush(&mut self) -> Result<(), NvmeError> {
+        NvmeDriver::flush(self)
+    }
+
+    fn block_size(&self) -> u32 {
+        self.ns_info.as_ref().map(|ns| ns.block_size).unwrap_or(4096)
+    }
+
+    fn total_blocks(&self) -> u64 {
+        self.ns_info.as_ref().map(|ns| ns.block_count).unwrap_or(0)
+    }
+}

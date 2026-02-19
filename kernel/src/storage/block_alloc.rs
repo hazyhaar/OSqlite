@@ -10,8 +10,9 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::drivers::nvme::{NvmeDriver, NvmeError};
+use crate::drivers::nvme::NvmeError;
 use crate::mem::DmaBuf;
+use super::block_device::BlockDevice;
 
 /// Superblock magic: "HVNOS\x01\x00\x00" in little-endian.
 const SUPERBLOCK_MAGIC: u64 = 0x0000_01_534F4E5648; // "HVNOS\x01"
@@ -72,10 +73,24 @@ impl BlockAllocator {
         }
     }
 
+    /// Initialize for testing — creates an in-memory allocator without disk I/O.
+    #[cfg(test)]
+    pub fn init_for_test(&mut self, data_blocks: u64, block_size: u32, data_start_lba: u64) {
+        let bitmap_words = ((data_blocks + 63) / 64) as usize;
+        self.bitmap = vec![0u64; bitmap_words];
+        self.data_block_count = data_blocks;
+        self.data_start_lba = data_start_lba;
+        self.bitmap_start_lba = 1;
+        self.bitmap_on_disk_blocks = 1;
+        self.block_size = block_size;
+        self.free_count = data_blocks;
+        self.dirty = false;
+    }
+
     /// Format a blank NVMe namespace — write superblock, zeroed bitmap,
     /// zeroed file table.
     pub fn format(
-        nvme: &mut NvmeDriver,
+        dev: &mut dyn BlockDevice,
         total_blocks: u64,
         block_size: u32,
     ) -> Result<Self, NvmeError> {
@@ -118,20 +133,20 @@ impl BlockAllocator {
             )
         };
         buf.copy_from_slice(sb_bytes);
-        nvme.write_blocks(0, 1, &buf)?;
+        dev.write_blocks(0, 1, &buf)?;
 
         // Write zeroed bitmap (all free)
         let zero_buf = DmaBuf::alloc(block_size as usize)
             .map_err(|_| NvmeError::OutOfMemory)?;
         for i in 0..bitmap_blocks {
-            nvme.write_blocks(1 + i, 1, &zero_buf)?;
+            dev.write_blocks(1 + i, 1, &zero_buf)?;
         }
 
         // Write zeroed file table
-        nvme.write_blocks(1 + bitmap_blocks, 1, &zero_buf)?;
+        dev.write_blocks(1 + bitmap_blocks, 1, &zero_buf)?;
 
         // Flush to make everything durable
-        nvme.flush()?;
+        dev.flush()?;
 
         // Build in-memory state
         let bitmap_words = ((data_blocks + 63) / 64) as usize;
@@ -150,15 +165,13 @@ impl BlockAllocator {
     }
 
     /// Load an existing allocator from a formatted NVMe namespace.
-    pub fn load(nvme: &mut NvmeDriver) -> Result<Self, NvmeError> {
+    pub fn load(dev: &mut dyn BlockDevice) -> Result<Self, NvmeError> {
         // Read superblock
-        let block_size = nvme.namespace_info()
-            .ok_or(NvmeError::NotInitialized)?
-            .block_size;
+        let block_size = dev.block_size();
 
         let mut buf = DmaBuf::alloc(block_size as usize)
             .map_err(|_| NvmeError::OutOfMemory)?;
-        nvme.read_blocks(0, 1, &mut buf)?;
+        dev.read_blocks(0, 1, &mut buf)?;
 
         let sb = unsafe { &*(buf.as_ptr() as *const Superblock) };
         if !sb.is_valid() {
@@ -174,7 +187,7 @@ impl BlockAllocator {
 
         let words_per_block = block_size as usize / 8;
         for blk in 0..sb.bitmap_block_count {
-            nvme.read_blocks(sb.bitmap_start_lba + blk, 1, &mut bitmap_buf)?;
+            dev.read_blocks(sb.bitmap_start_lba + blk, 1, &mut bitmap_buf)?;
 
             let src = bitmap_buf.as_slice();
             let word_offset = blk as usize * words_per_block;
@@ -281,7 +294,7 @@ impl BlockAllocator {
     }
 
     /// Flush the bitmap to disk if dirty.
-    pub fn flush(&mut self, nvme: &mut NvmeDriver) -> Result<(), NvmeError> {
+    pub fn flush(&mut self, dev: &mut dyn BlockDevice) -> Result<(), NvmeError> {
         if !self.dirty {
             return Ok(());
         }
@@ -308,7 +321,7 @@ impl BlockAllocator {
                 }
             }
 
-            nvme.write_blocks(self.bitmap_start_lba + blk, 1, &buf)?;
+            dev.write_blocks(self.bitmap_start_lba + blk, 1, &buf)?;
         }
 
         self.dirty = false;
