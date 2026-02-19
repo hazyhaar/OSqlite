@@ -57,6 +57,34 @@ pub fn inb(port: u16) -> u8 {
     val
 }
 
+/// Write a 16-bit value to an I/O port.
+#[inline(always)]
+pub fn outw(port: u16, val: u16) {
+    unsafe {
+        core::arch::asm!(
+            "out dx, ax",
+            in("dx") port,
+            in("ax") val,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// Read a 16-bit value from an I/O port.
+#[inline(always)]
+pub fn inw(port: u16) -> u16 {
+    let val: u16;
+    unsafe {
+        core::arch::asm!(
+            "in ax, dx",
+            in("dx") port,
+            out("ax") val,
+            options(nostack, preserves_flags),
+        );
+    }
+    val
+}
+
 /// Write a 32-bit value to an I/O port.
 #[inline(always)]
 pub fn outl(port: u16, val: u32) {

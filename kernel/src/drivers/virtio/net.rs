@@ -1,43 +1,48 @@
-/// Virtio-net driver — paravirtualized NIC for QEMU.
+/// Virtio-net driver — paravirtualized NIC for QEMU (legacy mode).
 ///
-/// This is HeavenOS's path to the network. QEMU exposes a virtio-net
-/// PCI device that we configure through MMIO registers and communicate
-/// with via virtqueues (shared memory ring buffers).
+/// This driver targets legacy virtio (device ID 0x1000) with port I/O
+/// transport. All register access goes through x86 in/out instructions
+/// at the I/O port base from BAR0.
 ///
-/// The driver provides raw Ethernet frame send/receive, which feeds
-/// into smoltcp for TCP/IP.
+/// Legacy register layout at BAR0 (I/O port base):
+///   0x00  Device Features      (RO, 32-bit)
+///   0x04  Driver Features      (WO, 32-bit)
+///   0x08  Queue Address (PFN)  (RW, 32-bit) — phys/4096
+///   0x0C  Queue Size           (RO, 16-bit)
+///   0x0E  Queue Select         (RW, 16-bit)
+///   0x10  Queue Notify         (WO, 16-bit)
+///   0x12  Device Status        (RW, 8-bit)
+///   0x13  ISR Status           (RO, 8-bit)
+///   0x14+ Device-specific config (MAC at 0x14..0x19)
 use alloc::vec::Vec;
 use spin::Mutex;
 
+use crate::arch::x86_64::{inb, inw, inl, outb, outw, outl};
 use crate::mem::DmaBuf;
 use super::virtqueue::Virtqueue;
 
-/// Virtio PCI capability offsets (virtio 1.0+ modern device).
-mod virtio_regs {
-    // Common configuration
-    pub const DEVICE_FEATURE: usize = 0x00;
-    pub const DRIVER_FEATURE: usize = 0x04;
-    pub const DEVICE_STATUS: usize = 0x14;
-    pub const QUEUE_SELECT: usize = 0x16;
-    pub const QUEUE_SIZE: usize = 0x18;
-    pub const QUEUE_ENABLE: usize = 0x1C;
-    pub const QUEUE_DESC: usize = 0x20;
-    pub const QUEUE_AVAIL: usize = 0x28;
-    pub const QUEUE_USED: usize = 0x30;
+/// Legacy virtio register offsets from I/O port base.
+mod regs {
+    pub const DEVICE_FEATURES: u16 = 0x00;  // 32-bit RO
+    pub const DRIVER_FEATURES: u16 = 0x04;  // 32-bit WO
+    pub const QUEUE_ADDRESS: u16   = 0x08;  // 32-bit RW (PFN)
+    pub const QUEUE_SIZE: u16      = 0x0C;  // 16-bit RO
+    pub const QUEUE_SELECT: u16    = 0x0E;  // 16-bit RW
+    pub const QUEUE_NOTIFY: u16    = 0x10;  // 16-bit WO
+    pub const DEVICE_STATUS: u16   = 0x12;  // 8-bit RW
+    pub const ISR_STATUS: u16      = 0x13;  // 8-bit RO
+    pub const MAC_BASE: u16        = 0x14;  // device-specific: 6 bytes
 }
 
 /// Virtio device status bits.
 const STATUS_ACKNOWLEDGE: u8 = 1;
 const STATUS_DRIVER: u8 = 2;
-const STATUS_FEATURES_OK: u8 = 8;
 const STATUS_DRIVER_OK: u8 = 4;
-const STATUS_FAILED: u8 = 128;
 
-/// Virtio-net feature bits we care about.
-const VIRTIO_NET_F_MAC: u64 = 1 << 5;        // Device has MAC address
-const VIRTIO_NET_F_STATUS: u64 = 1 << 16;    // Link status available
+/// Virtio-net feature bits.
+const VIRTIO_NET_F_MAC: u32 = 1 << 5;
 
-/// Virtio-net header prepended to every packet.
+/// Virtio-net header prepended to every packet (legacy, 10 bytes).
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct VirtioNetHeader {
@@ -47,28 +52,27 @@ pub struct VirtioNetHeader {
     pub gso_size: u16,
     pub csum_start: u16,
     pub csum_offset: u16,
-    // No num_buffers for tx
 }
 
-const NET_HDR_SIZE: usize = core::mem::size_of::<VirtioNetHeader>();
+const NET_HDR_SIZE: usize = core::mem::size_of::<VirtioNetHeader>(); // 10 bytes
 
-/// Maximum Ethernet frame size + virtio header.
+/// Maximum Ethernet frame + virtio header.
 const RX_BUF_SIZE: usize = 1514 + NET_HDR_SIZE;
 
-/// Number of receive buffers pre-allocated.
+/// Number of pre-allocated receive buffers.
 const RX_POOL_SIZE: usize = 64;
 
-/// Virtio-net driver.
+/// Virtio-net driver (legacy, port I/O).
 pub struct VirtioNet {
-    /// MMIO base for common configuration.
-    common_cfg: *mut u8,
+    /// I/O port base from PCI BAR0.
+    iobase: u16,
     /// Receive virtqueue (queue 0).
     rx_queue: Virtqueue,
     /// Transmit virtqueue (queue 1).
     tx_queue: Virtqueue,
-    /// MAC address (6 bytes).
+    /// MAC address.
     mac: [u8; 6],
-    /// Pre-allocated receive buffers.
+    /// Pre-allocated receive buffers, indexed by descriptor index.
     rx_buffers: Vec<DmaBuf>,
     /// In-flight TX buffers awaiting device completion.
     tx_inflight: Vec<Option<DmaBuf>>,
@@ -77,55 +81,39 @@ pub struct VirtioNet {
 unsafe impl Send for VirtioNet {}
 
 impl VirtioNet {
-    /// Initialize the virtio-net device at the given MMIO address.
+    /// Initialize the virtio-net device at the given I/O port base.
     ///
     /// # Safety
-    /// `common_cfg` must point to the virtio common configuration space,
-    /// mapped as uncacheable.
-    pub unsafe fn new(common_cfg: *mut u8, net_cfg: *mut u8) -> Result<Self, VirtioNetError> {
-        // 1. Reset device
-        write_reg8(common_cfg, virtio_regs::DEVICE_STATUS, 0);
+    /// `iobase` must be the I/O port address from BAR0 of a legacy
+    /// virtio-net PCI device (vendor 0x1AF4, device 0x1000, subsys 1).
+    pub unsafe fn new(iobase: u16) -> Result<Self, VirtioNetError> {
+        // 1. Reset device (write 0 to status)
+        outb(iobase + regs::DEVICE_STATUS, 0);
 
-        // 2. Acknowledge device
-        write_reg8(common_cfg, virtio_regs::DEVICE_STATUS, STATUS_ACKNOWLEDGE);
+        // 2. Acknowledge: we see the device
+        outb(iobase + regs::DEVICE_STATUS, STATUS_ACKNOWLEDGE);
 
-        // 3. We know how to drive it
-        write_reg8(
-            common_cfg,
-            virtio_regs::DEVICE_STATUS,
-            STATUS_ACKNOWLEDGE | STATUS_DRIVER,
-        );
+        // 3. Driver: we know how to drive it
+        outb(iobase + regs::DEVICE_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
 
         // 4. Negotiate features (we want MAC address)
-        let device_features = read_reg32(common_cfg, virtio_regs::DEVICE_FEATURE) as u64;
-        let our_features = device_features & (VIRTIO_NET_F_MAC | VIRTIO_NET_F_STATUS);
-        write_reg32(common_cfg, virtio_regs::DRIVER_FEATURE, our_features as u32);
+        let device_features = inl(iobase + regs::DEVICE_FEATURES);
+        let our_features = device_features & VIRTIO_NET_F_MAC;
+        outl(iobase + regs::DRIVER_FEATURES, our_features);
+        // Legacy virtio has no FEATURES_OK step — features are just set.
 
-        // 5. Features OK
-        write_reg8(
-            common_cfg,
-            virtio_regs::DEVICE_STATUS,
-            STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK,
-        );
-
-        let status = read_reg8(common_cfg, virtio_regs::DEVICE_STATUS);
-        if status & STATUS_FEATURES_OK == 0 {
-            return Err(VirtioNetError::FeatureNegotiationFailed);
-        }
-
-        // 6. Read MAC address from device-specific config
+        // 5. Read MAC address from device-specific config
         let mut mac = [0u8; 6];
         for i in 0..6 {
-            mac[i] = core::ptr::read_volatile(net_cfg.add(i));
+            mac[i] = inb(iobase + regs::MAC_BASE + i as u16);
         }
 
-        // 7. Set up virtqueues
-        // Queue 0 = rx, Queue 1 = tx
-        let rx_queue = Self::setup_queue(common_cfg, 0)?;
-        let tx_queue = Self::setup_queue(common_cfg, 1)?;
+        // 6. Set up virtqueues
+        let rx_queue = Self::setup_queue(iobase, 0)?;
+        let tx_queue = Self::setup_queue(iobase, 1)?;
 
         let mut driver = Self {
-            common_cfg,
+            iobase,
             rx_queue,
             tx_queue,
             mac,
@@ -133,43 +121,34 @@ impl VirtioNet {
             tx_inflight: Vec::new(),
         };
 
-        // 8. Pre-allocate and post receive buffers
+        // 7. Pre-allocate and post receive buffers
         driver.fill_rx_pool()?;
 
-        // 9. Driver OK — device is live
-        write_reg8(
-            common_cfg,
-            virtio_regs::DEVICE_STATUS,
-            STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK,
+        // 8. Driver OK — device is live
+        outb(
+            iobase + regs::DEVICE_STATUS,
+            STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_DRIVER_OK,
         );
 
         Ok(driver)
     }
 
-    /// Configure a virtqueue.
-    unsafe fn setup_queue(
-        common_cfg: *mut u8,
-        queue_idx: u16,
-    ) -> Result<Virtqueue, VirtioNetError> {
+    /// Configure a virtqueue for legacy virtio.
+    unsafe fn setup_queue(iobase: u16, queue_idx: u16) -> Result<Virtqueue, VirtioNetError> {
         // Select queue
-        write_reg16(common_cfg, virtio_regs::QUEUE_SELECT, queue_idx);
+        outw(iobase + regs::QUEUE_SELECT, queue_idx);
 
-        // Check queue size
-        let size = read_reg16(common_cfg, virtio_regs::QUEUE_SIZE);
+        // Read queue size from device
+        let size = inw(iobase + regs::QUEUE_SIZE);
         if size == 0 {
             return Err(VirtioNetError::QueueNotAvailable);
         }
 
-        // Allocate virtqueue
-        let vq = Virtqueue::new().map_err(|_| VirtioNetError::OutOfMemory)?;
+        // Allocate virtqueue with device-reported size
+        let vq = Virtqueue::new(size).map_err(|_| VirtioNetError::OutOfMemory)?;
 
-        // Tell device where the queue is
-        write_reg64(common_cfg, virtio_regs::QUEUE_DESC, vq.desc_phys().as_u64());
-        write_reg64(common_cfg, virtio_regs::QUEUE_AVAIL, vq.avail_phys().as_u64());
-        write_reg64(common_cfg, virtio_regs::QUEUE_USED, vq.used_phys().as_u64());
-
-        // Enable queue
-        write_reg16(common_cfg, virtio_regs::QUEUE_ENABLE, 1);
+        // Tell device where the queue is: write PFN to Queue Address register
+        outl(iobase + regs::QUEUE_ADDRESS, vq.pfn());
 
         Ok(vq)
     }
@@ -179,9 +158,11 @@ impl VirtioNet {
         for _ in 0..RX_POOL_SIZE {
             let buf = DmaBuf::alloc(RX_BUF_SIZE).map_err(|_| VirtioNetError::OutOfMemory)?;
             let phys = buf.phys_addr();
-            self.rx_queue.add_buf(phys, RX_BUF_SIZE as u32, true); // device-writable
+            self.rx_queue.add_buf(phys, RX_BUF_SIZE as u32, true);
             self.rx_buffers.push(buf);
         }
+        // Notify device that rx queue has buffers
+        self.notify_queue(0);
         Ok(())
     }
 
@@ -190,7 +171,6 @@ impl VirtioNet {
         while let Some((desc_idx, _len)) = self.tx_queue.poll_used() {
             let idx = desc_idx as usize;
             if idx < self.tx_inflight.len() {
-                // Drop the buffer, freeing the DMA memory
                 self.tx_inflight[idx] = None;
             }
         }
@@ -198,7 +178,6 @@ impl VirtioNet {
 
     /// Transmit an Ethernet frame. Prepends the virtio-net header.
     pub fn transmit(&mut self, frame: &[u8]) -> Result<(), VirtioNetError> {
-        // Reclaim any completed TX buffers first
         self.reclaim_tx_buffers();
 
         let total_len = NET_HDR_SIZE + frame.len();
@@ -222,9 +201,9 @@ impl VirtioNet {
 
         match self.tx_queue.add_buf(phys, total_len as u32, false) {
             Some(desc_idx) => {
-                // Notify device (write to queue notify register)
-                self.notify_tx();
-                // Track the buffer so it's freed when the device returns it
+                // Notify device: tx is queue 1
+                self.notify_queue(1);
+                // Track buffer until device returns it
                 let idx = desc_idx as usize;
                 if idx >= self.tx_inflight.len() {
                     self.tx_inflight.resize_with(idx + 1, || None);
@@ -245,13 +224,13 @@ impl VirtioNet {
             let buf = &self.rx_buffers[desc_idx as usize];
             buf.invalidate_cache();
 
-            let frame_start = NET_HDR_SIZE;
-            let frame_end = len as usize;
-            let frame = buf.as_slice()[frame_start..frame_end].to_vec();
+            let frame = buf.as_slice()[NET_HDR_SIZE..len as usize].to_vec();
 
             // Re-post the buffer for future receives
             let phys = buf.phys_addr();
             self.rx_queue.add_buf(phys, RX_BUF_SIZE as u32, true);
+            // Notify device that rx queue has a new buffer
+            self.notify_queue(0);
 
             Some(frame)
         } else {
@@ -264,20 +243,16 @@ impl VirtioNet {
         self.mac
     }
 
-    /// Notify the device that the tx queue has new buffers.
-    fn notify_tx(&self) {
-        // For modern virtio: write to the queue notify offset.
-        // The exact mechanism depends on the PCI capability structure.
-        // For legacy virtio (port I/O), write queue index to port + 16.
-        //
-        // TODO: use the actual notify offset from PCI capabilities.
-        // For now, this is a placeholder that works with legacy virtio.
+    /// Notify the device that a queue has new buffers.
+    /// For legacy virtio: write the queue index to the Queue Notify register.
+    #[inline]
+    fn notify_queue(&self, queue_idx: u16) {
+        outw(self.iobase + regs::QUEUE_NOTIFY, queue_idx);
     }
 }
 
-/// Scan PCI for a virtio-net device.
-/// Virtio devices have vendor ID 0x1AF4, device IDs 0x1000-0x103F (legacy)
-/// or 0x1041 (modern virtio-net).
+/// Scan PCI for a legacy virtio-net device.
+/// Legacy virtio: vendor 0x1AF4, device 0x1000, subsystem ID 1 (network).
 pub fn find_virtio_net() -> Option<VirtioNetPciInfo> {
     for bus in 0..=255u16 {
         for device in 0..32u8 {
@@ -290,35 +265,32 @@ pub fn find_virtio_net() -> Option<VirtioNetPciInfo> {
 
             let device_id = ((vendor_device >> 16) & 0xFFFF) as u16;
 
-            // Legacy virtio-net: device_id 0x1000
-            // Modern virtio-net: device_id 0x1041
-            if device_id != 0x1000 && device_id != 0x1041 {
+            // Only accept legacy virtio (device ID 0x1000)
+            if device_id != 0x1000 {
                 continue;
             }
 
-            // Check subsystem ID to confirm it's a network device
+            // Check subsystem ID to confirm it's a network device (subsys 1)
             let subsys = pci_read32(bus as u8, device, 0, 0x2C);
             let subsys_id = ((subsys >> 16) & 0xFFFF) as u16;
-
-            // Subsystem device ID 1 = network
-            if device_id == 0x1000 && subsys_id != 1 {
+            if subsys_id != 1 {
                 continue;
             }
 
-            // Enable bus mastering
+            // Enable bus mastering + I/O space access
             let cmd = pci_read32(bus as u8, device, 0, 0x04);
-            pci_write32(bus as u8, device, 0, 0x04, cmd | 0x06);
+            pci_write32(bus as u8, device, 0, 0x04, cmd | 0x05); // bit 0 = I/O, bit 2 = bus master
 
-            // Read BARs
-            let bar0 = pci_read32(bus as u8, device, 0, 0x10) as u64 & !0xF;
-            let bar1 = pci_read32(bus as u8, device, 0, 0x14) as u64 & !0xF;
+            // Read BAR0 — for legacy virtio this is an I/O port BAR
+            let bar0_raw = pci_read32(bus as u8, device, 0, 0x10);
+            // Bit 0 = 1 means I/O space (as expected for legacy virtio)
+            let iobase = (bar0_raw & !0x3) as u16;
 
             return Some(VirtioNetPciInfo {
                 bus: bus as u8,
                 device,
                 device_id,
-                bar0,
-                bar1,
+                iobase,
             });
         }
     }
@@ -330,8 +302,7 @@ pub struct VirtioNetPciInfo {
     pub bus: u8,
     pub device: u8,
     pub device_id: u16,
-    pub bar0: u64,
-    pub bar1: u64,
+    pub iobase: u16,
 }
 
 #[derive(Debug)]
@@ -355,19 +326,15 @@ impl core::fmt::Display for VirtioNetError {
     }
 }
 
-// PCI helpers (same as NVMe driver — should be shared, but keeping local for now)
+// PCI configuration space access via port I/O (0xCF8/0xCFC).
 fn pci_read32(bus: u8, device: u8, func: u8, offset: u8) -> u32 {
     let addr: u32 = 0x8000_0000
         | ((bus as u32) << 16)
         | ((device as u32) << 11)
         | ((func as u32) << 8)
         | ((offset as u32) & 0xFC);
-    unsafe {
-        core::arch::asm!("out dx, eax", in("dx") 0xCF8u16, in("eax") addr, options(nostack, preserves_flags));
-        let val: u32;
-        core::arch::asm!("in eax, dx", in("dx") 0xCFCu16, out("eax") val, options(nostack, preserves_flags));
-        val
-    }
+    outl(0xCF8, addr);
+    inl(0xCFC)
 }
 
 fn pci_write32(bus: u8, device: u8, func: u8, offset: u8, val: u32) {
@@ -376,38 +343,8 @@ fn pci_write32(bus: u8, device: u8, func: u8, offset: u8, val: u32) {
         | ((device as u32) << 11)
         | ((func as u32) << 8)
         | ((offset as u32) & 0xFC);
-    unsafe {
-        core::arch::asm!("out dx, eax", in("dx") 0xCF8u16, in("eax") addr, options(nostack, preserves_flags));
-        core::arch::asm!("out dx, eax", in("dx") 0xCFCu16, in("eax") val, options(nostack, preserves_flags));
-    }
-}
-
-unsafe fn read_reg8(base: *mut u8, offset: usize) -> u8 {
-    core::ptr::read_volatile(base.add(offset))
-}
-
-unsafe fn read_reg16(base: *mut u8, offset: usize) -> u16 {
-    core::ptr::read_volatile(base.add(offset) as *const u16)
-}
-
-unsafe fn read_reg32(base: *mut u8, offset: usize) -> u32 {
-    core::ptr::read_volatile(base.add(offset) as *const u32)
-}
-
-unsafe fn write_reg8(base: *mut u8, offset: usize, val: u8) {
-    core::ptr::write_volatile(base.add(offset), val);
-}
-
-unsafe fn write_reg16(base: *mut u8, offset: usize, val: u16) {
-    core::ptr::write_volatile(base.add(offset) as *mut u16, val);
-}
-
-unsafe fn write_reg32(base: *mut u8, offset: usize, val: u32) {
-    core::ptr::write_volatile(base.add(offset) as *mut u32, val);
-}
-
-unsafe fn write_reg64(base: *mut u8, offset: usize, val: u64) {
-    core::ptr::write_volatile(base.add(offset) as *mut u64, val);
+    outl(0xCF8, addr);
+    outl(0xCFC, val);
 }
 
 /// Global virtio-net driver instance.
