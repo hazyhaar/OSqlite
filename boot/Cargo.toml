@@ -1,6 +1,0 @@
-[package]
-name = "heavenos-boot"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]

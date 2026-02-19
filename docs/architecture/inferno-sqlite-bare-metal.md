@@ -37,9 +37,9 @@ namespace while keeping the GPU data path out of the file abstraction.
 | ---------------- | --------------------------------------------------- |
 | CPU              | x86_64 with MMU, APIC timer, TSC                   |
 | NVMe             | PCIe-attached, supports PRP lists, Flush command    |
-| RAM              | ≥ 512 MB, identity-mapped or with known phys→virt   |
+| RAM              | ≥ 512 MB, accessed via HHDM (higher-half direct map)|
 | GPU (optional)   | PCIe, BAR0-mapped, vendor-specific command protocol |
-| Boot             | UEFI → custom bootloader → kernel                   |
+| Boot             | Limine bootloader (v9.x, limine protocol)           |
 
 ---
 
@@ -47,9 +47,9 @@ namespace while keeping the GPU data path out of the file abstraction.
 
 HeavenOS uses a **hybrid memory model**:
 
-- **Kernel space**: identity-mapped (virt == phys) for the first N GB.
-  This simplifies DMA address translation — any kernel buffer's virtual
-  address IS its physical address.
+- **Kernel space**: higher-half direct map (HHDM) provided by Limine.
+  All physical memory is mapped at a fixed offset (typically 0xFFFF800000000000).
+  `PhysAddr::as_ptr()` adds the HHDM offset to convert phys→virt.
 - **User space** (if/when added): separate page tables per process.
   For the initial single-address-space design, all code runs in ring 0.
 
