@@ -62,15 +62,15 @@ const INITIAL_ALLOC_BLOCKS: u64 = 16; // 64 KiB at 4096 block size
 /// Per-open-file state. Stored alongside the sqlite3_file header.
 pub struct HeavenFile {
     /// Index into the file table.
-    file_table_index: usize,
+    pub file_table_index: usize,
     /// Cached start LBA (absolute, not data-block index).
-    start_lba: u64,
+    pub start_lba: u64,
     /// Cached block count.
-    block_count: u64,
+    pub block_count: u64,
     /// Cached byte length.
-    byte_length: u64,
+    pub byte_length: u64,
     /// Block size (from NVMe).
-    block_size: u32,
+    pub block_size: u32,
 }
 
 // ---- Shared Memory for WAL ----

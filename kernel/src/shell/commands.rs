@@ -56,6 +56,14 @@ pub fn dispatch(line: &str) {
                 serial_println!("usage: model <name>");
             }
         }
+        "sql" => {
+            let rest: alloc::string::String = parts.collect::<alloc::vec::Vec<&str>>().join(" ");
+            if rest.is_empty() {
+                serial_println!("usage: sql <statement>");
+            } else {
+                cmd_sql(&rest);
+            }
+        }
         "clear" => cmd_clear(),
         "panic" => cmd_panic(),
         "reboot" => cmd_reboot(),
@@ -78,6 +86,7 @@ fn cmd_help() {
     serial_println!("  ls [path]     list namespace entries");
     serial_println!("  cat <path>    read a namespace file");
     serial_println!("  echo <text>   print text");
+    serial_println!("  sql <stmt>    execute SQL on the system database");
     serial_println!();
     serial_println!("Claude API:");
     serial_println!("  apikey <key>  set Anthropic API key");
@@ -278,6 +287,17 @@ fn cmd_ask(prompt: &str) {
     serial_println!("  # On host, run a simple TLS proxy:");
     serial_println!("  socat TCP-LISTEN:8080,fork,reuseaddr \\");
     serial_println!("    OPENSSL:api.anthropic.com:443");
+}
+
+fn cmd_sql(query: &str) {
+    match crate::sqlite::exec_and_format(query) {
+        Ok(output) => {
+            serial_print!("{}", output);
+        }
+        Err(e) => {
+            serial_println!("SQL error: {}", e);
+        }
+    }
 }
 
 fn cmd_reboot() {

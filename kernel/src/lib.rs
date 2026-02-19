@@ -11,5 +11,6 @@ pub mod fs;
 pub mod mem;
 pub mod net;
 pub mod shell;
+pub mod sqlite;
 pub mod storage;
 pub mod vfs;

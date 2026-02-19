@@ -10,6 +10,9 @@ static_assertions = "1"
 limine = "0.5"
 smoltcp = { version = "0.11", default-features = false, features = ["medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-tcp", "alloc"] }
 
+[build-dependencies]
+cc = "1"
+
 [features]
 default = []
 test-mock-nvme = []    # Use RAM-backed NVMe for testing
