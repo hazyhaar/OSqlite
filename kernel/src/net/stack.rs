@@ -56,15 +56,9 @@ impl NetStack {
         })
     }
 
-    /// Get the current timestamp for smoltcp.
+    /// Get the current timestamp for smoltcp (calibrated TSC).
     fn now() -> Instant {
-        // Use TSC-based millisecond counter.
-        // TODO: calibrate TSC at boot for accurate time.
-        // For now, use a simple counter.
-        use crate::arch::x86_64::cpu::rdtsc;
-        let tsc = rdtsc();
-        // Assume ~2 GHz TSC — 1ms = 2_000_000 ticks
-        let ms = tsc / 2_000_000;
+        let ms = crate::arch::x86_64::timer::monotonic_ms();
         Instant::from_millis(ms as i64)
     }
 

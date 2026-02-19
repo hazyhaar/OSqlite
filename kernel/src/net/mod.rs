@@ -12,3 +12,6 @@ mod device;
 pub mod stack;
 
 pub use stack::NetStack;
+
+/// Global network stack instance (initialized during boot if virtio-net is present).
+pub static NET_STACK: spin::Mutex<Option<NetStack>> = spin::Mutex::new(None);

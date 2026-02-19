@@ -10,6 +10,7 @@ pub mod cpu;
 pub mod gdt;
 pub mod idt;
 pub mod pic;
+pub mod timer;
 
 /// Halt the CPU until the next interrupt.
 #[inline(always)]

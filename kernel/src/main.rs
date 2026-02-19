@@ -106,6 +106,11 @@ pub extern "C" fn kmain() -> ! {
     serial_println!("[cpu] CLFLUSHOPT: {}", x86_64::cpu::has_clflushopt());
     serial_println!("[cpu] Invariant TSC: {}", x86_64::cpu::has_invariant_tsc());
 
+    // 6b. Calibrate TSC using PIT channel 2
+    x86_64::timer::calibrate_tsc();
+    let freq_mhz = x86_64::timer::tsc_freq_hz() / 1_000_000;
+    serial_println!("[timer] TSC frequency: {} MHz", freq_mhz);
+
     // 7. Scan PCI for NVMe controller
     serial_println!("[pci] Scanning for NVMe controller...");
     match nvme::pci::find_nvme_controller() {
@@ -161,7 +166,20 @@ pub extern "C" fn kmain() -> ! {
         }
     }
 
-    // 11. Initialize Styx namespace
+    // 11. Initialize TCP/IP stack (requires virtio-net)
+    if heavenos_kernel::drivers::virtio::net::VIRTIO_NET.lock().is_some() {
+        match heavenos_kernel::net::NetStack::new() {
+            Some(stack) => {
+                serial_println!("[net] TCP/IP stack ready (10.0.2.15, gw 10.0.2.2)");
+                *heavenos_kernel::net::NET_STACK.lock() = Some(stack);
+            }
+            None => {
+                serial_println!("[net] Failed to create TCP/IP stack");
+            }
+        }
+    }
+
+    // 12. Initialize Styx namespace
     let root = styx::namespace::build_root();
     let _server = styx::StyxServer::new(root);
     serial_println!("[styx] Namespace ready");

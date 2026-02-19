@@ -146,8 +146,11 @@ fn cmd_cpu() {
 }
 
 fn cmd_uptime() {
-    // TODO: track boot TSC and compute elapsed time
-    serial_println!("uptime: not yet implemented (needs TSC calibration)");
+    let total_secs = crate::arch::x86_64::timer::uptime_secs();
+    let hours = total_secs / 3600;
+    let mins = (total_secs % 3600) / 60;
+    let secs = total_secs % 60;
+    serial_println!("up {}h {:02}m {:02}s", hours, mins, secs);
 }
 
 fn cmd_ls(path: &str) {
@@ -262,31 +265,45 @@ fn cmd_ask(prompt: &str) {
         }
     };
 
+    // Check network stack
+    let mut net_guard = crate::net::NET_STACK.lock();
+    let net = match net_guard.as_mut() {
+        Some(n) => n,
+        None => {
+            serial_println!("Error: network stack not initialized");
+            serial_println!("  (need virtio-net device in QEMU)");
+            return;
+        }
+    };
+
+    // Build config
+    let config = crate::api::ClaudeConfig {
+        api_key,
+        ..crate::api::ClaudeConfig::default_proxy()
+    };
+
     serial_println!("[connecting to Claude API via proxy at 10.0.2.2:8080...]");
     serial_println!();
 
-    // For now, show what WOULD happen since we need the network stack
-    // fully initialized. The API client code is ready — it needs:
-    // 1. virtio-net driver initialized during boot
-    // 2. NetStack created and passed to the shell context
-    // 3. TLS proxy running on the host
-
-    serial_println!("POST /v1/messages HTTP/1.1");
-    serial_println!("Host: api.anthropic.com");
-    serial_println!("X-API-Key: {}...{}", &api_key[..api_key.len().min(12)],
-        if api_key.len() > 16 { &api_key[api_key.len()-4..] } else { "" });
-    serial_println!("Content-Type: application/json");
-    serial_println!();
-    serial_println!("{{\"model\":\"claude-sonnet-4-5-20250929\",\"messages\":[{{\"role\":\"user\",\"content\":\"{}\"}}]}}", prompt);
-    serial_println!();
-    serial_println!("[network stack not yet connected — run QEMU with:");
-    serial_println!("  -device virtio-net-pci,netdev=net0");
-    serial_println!("  -netdev user,id=net0,hostfwd=tcp::8080-:80");
-    serial_println!(" and a TLS proxy on the host:]");
-    serial_println!();
-    serial_println!("  # On host, run a simple TLS proxy:");
-    serial_println!("  socat TCP-LISTEN:8080,fork,reuseaddr \\");
-    serial_println!("    OPENSSL:api.anthropic.com:443");
+    // Send request and stream response
+    match crate::api::claude_request(net, &config, prompt, |token| {
+        serial_print!("{}", token);
+    }) {
+        Ok(_) => {
+            serial_println!();
+        }
+        Err(e) => {
+            serial_println!();
+            serial_println!("[API error: {}]", e);
+            serial_println!();
+            serial_println!("Ensure QEMU runs with:");
+            serial_println!("  -device virtio-net-pci,netdev=net0");
+            serial_println!("  -netdev user,id=net0,hostfwd=tcp::8080-:80");
+            serial_println!("and a TLS proxy on the host:");
+            serial_println!("  socat TCP-LISTEN:8080,fork,reuseaddr \\");
+            serial_println!("    OPENSSL:api.anthropic.com:443");
+        }
+    }
 }
 
 fn cmd_sql(query: &str) {

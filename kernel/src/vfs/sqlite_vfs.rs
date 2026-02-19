@@ -609,18 +609,9 @@ impl HeavenVfs {
 
     // ---- xSleep ----
 
-    /// Sleep for `microseconds`. Uses a busy-wait loop calibrated from TSC.
-    /// TODO: replace with proper APIC timer sleep.
+    /// Sleep for `microseconds` using calibrated TSC busy-wait.
     pub fn sleep(&self, microseconds: u64) -> u64 {
-        // Busy-wait using TSC. Assumes ~2 GHz TSC (very rough).
-        // A real implementation calibrates TSC frequency during boot.
-        let tsc_freq_approx: u64 = 2_000_000_000; // 2 GHz estimate
-        let target_ticks = microseconds * (tsc_freq_approx / 1_000_000);
-
-        let start = rdtsc();
-        while rdtsc() - start < target_ticks {
-            core::hint::spin_loop();
-        }
+        crate::arch::x86_64::timer::delay_us(microseconds);
         microseconds
     }
 
@@ -668,15 +659,6 @@ impl HeavenVfs {
 }
 
 // ---- CPU instruction helpers ----
-
-fn rdtsc() -> u64 {
-    let lo: u32;
-    let hi: u32;
-    unsafe {
-        core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nostack, preserves_flags));
-    }
-    ((hi as u64) << 32) | (lo as u64)
-}
 
 fn rdrand_u64() -> u64 {
     let mut val: u64;
