@@ -12,7 +12,7 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::ptr;
 use spin::Mutex;
 
-use super::phys::{PhysAddr, PAGE_SIZE, PHYS_ALLOCATOR};
+use super::phys::{PhysAddr, PAGE_SIZE, PHYS_ALLOCATOR, hhdm_offset};
 
 /// Allocation header, stored immediately before the returned pointer.
 #[repr(C)]
@@ -177,9 +177,10 @@ unsafe impl GlobalAlloc for SlabAllocator {
 
         if header.class == LARGE_ALLOC {
             // Large allocation: free pages
+            // header_ptr is a virtual address (HHDM-mapped); convert back to physical.
             let total = header.size + HEADER_SIZE;
             let pages = (total + PAGE_SIZE - 1) / PAGE_SIZE;
-            let phys = PhysAddr::new(header_ptr as u64);
+            let phys = PhysAddr::new(header_ptr as u64 - hhdm_offset());
             PHYS_ALLOCATOR.free_pages(phys, pages);
         } else {
             // Slab: return to free list

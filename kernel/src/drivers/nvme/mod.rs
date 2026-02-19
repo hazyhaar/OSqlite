@@ -256,7 +256,7 @@ impl NvmeDriver {
         let qp = self.io_queue.as_mut().ok_or(NvmeError::NotInitialized)?;
         let qid = qp.id() as usize;
 
-        let (prp1, prp2) = command::build_prp(buf, block_count as usize * bs as usize);
+        let (prp1, prp2, _prp_list) = command::build_prp(buf, block_count as usize * bs as usize);
 
         let cmd = SubmissionEntry::read(nsid, lba, block_count - 1, prp1, prp2);
         qp.submit(cmd);
@@ -268,6 +268,7 @@ impl NvmeDriver {
             if let Some(status) = qp.poll_completion() {
                 let cq_head = qp.cq_head();
                 unsafe { Self::write_doorbell(bar0, regs::SQ0TDBL + (2 * qid + 1) * stride, cq_head as u32) };
+                // _prp_list dropped here after command completes
                 if status != 0 {
                     return Err(NvmeError::CommandFailed(status));
                 }
@@ -294,7 +295,7 @@ impl NvmeDriver {
         let qid = qp.id() as usize;
 
         buf.flush_cache();
-        let (prp1, prp2) = command::build_prp(buf, block_count as usize * bs as usize);
+        let (prp1, prp2, _prp_list) = command::build_prp(buf, block_count as usize * bs as usize);
 
         let cmd = SubmissionEntry::write(nsid, lba, block_count - 1, prp1, prp2);
         qp.submit(cmd);
@@ -306,6 +307,7 @@ impl NvmeDriver {
             if let Some(status) = qp.poll_completion() {
                 let cq_head = qp.cq_head();
                 unsafe { Self::write_doorbell(bar0, regs::SQ0TDBL + (2 * qid + 1) * stride, cq_head as u32) };
+                // _prp_list dropped here after command completes
                 if status != 0 {
                     return Err(NvmeError::CommandFailed(status));
                 }

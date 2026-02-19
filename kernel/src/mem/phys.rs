@@ -14,12 +14,12 @@ static HHDM_OFFSET: AtomicU64 = AtomicU64::new(0);
 /// Set the HHDM offset. Must be called once during early boot before any
 /// PhysAddr::as_ptr() calls.
 pub fn set_hhdm_offset(offset: u64) {
-    HHDM_OFFSET.store(offset, Ordering::Relaxed);
+    HHDM_OFFSET.store(offset, Ordering::Release);
 }
 
 /// Get the current HHDM offset.
 pub fn hhdm_offset() -> u64 {
-    HHDM_OFFSET.load(Ordering::Relaxed)
+    HHDM_OFFSET.load(Ordering::Acquire)
 }
 
 /// A physical address. Transparent wrapper for clarity.
@@ -39,7 +39,7 @@ impl PhysAddr {
     /// Convert to a virtual pointer via the HHDM (Higher-Half Direct Map).
     /// virt = phys + hhdm_offset.
     pub fn as_ptr<T>(self) -> *mut T {
-        let offset = HHDM_OFFSET.load(Ordering::Relaxed);
+        let offset = HHDM_OFFSET.load(Ordering::Acquire);
         (self.0 + offset) as *mut T
     }
 }

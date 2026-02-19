@@ -121,42 +121,35 @@ pub fn nvme_to_sqlite_error(err: &NvmeError) -> SqliteIoError {
 /// - If transfer fits in two pages (≤ 8192 bytes): prp1 = first page, prp2 = second page
 /// - If transfer spans more than two pages: prp1 = first page, prp2 = pointer to PRP list
 ///
-/// For simplicity, since our DMA buffers are physically contiguous, prp2 is
-/// just phys_addr + 4096 for the two-page case. For > 2 pages with contiguous
-/// memory, we could use a PRP list, but contiguous buffers allow direct offsets.
-pub fn build_prp(buf: &DmaBuf, transfer_size: usize) -> (PhysAddr, PhysAddr) {
+/// Returns (prp1, prp2, optional PRP list DmaBuf). The caller MUST keep the
+/// returned DmaBuf alive until the NVMe command completes, then drop it normally.
+pub fn build_prp(buf: &DmaBuf, transfer_size: usize) -> (PhysAddr, PhysAddr, Option<DmaBuf>) {
     let base = buf.phys_addr();
     let page_size: u64 = 4096;
 
     if transfer_size <= page_size as usize {
         // Single page: prp2 unused
-        (base, PhysAddr::new(0))
+        (base, PhysAddr::new(0), None)
     } else if transfer_size <= (page_size * 2) as usize {
         // Two pages: prp2 = second page
-        (base, PhysAddr::new(base.as_u64() + page_size))
+        (base, PhysAddr::new(base.as_u64() + page_size), None)
     } else {
         // More than two pages with contiguous memory.
-        // We MUST build a PRP list in a separate page.
-        // The PRP list contains physical addresses of pages 1..N
-        // (page 0 is in PRP1).
-        //
-        // For now, since our buffers are contiguous, we build the list
-        // with sequential addresses. A more general implementation would
-        // handle scattered pages.
-        //
-        // IMPORTANT: This creates a PRP list as a static-lifetime leak.
-        // In production, the PRP list buffer should be managed alongside
-        // the command lifecycle. For initial implementation, we accept this.
+        // We build a PRP list in a separate page and return it
+        // so the caller keeps it alive until command completion.
         build_prp_contiguous(base, transfer_size)
     }
 }
 
 /// Build PRP list for a contiguous buffer spanning > 2 pages.
 ///
+/// Returns (prp1, prp2, Some(prp_list_buf)). The PRP list DmaBuf must be
+/// kept alive by the caller until the NVMe command completes.
+///
 /// # Panics
 /// Panics if transfer requires > 512 PRP entries (> 2 MiB).
 /// NVMe spec: a PRP list must fit within a single page (512 entries max).
-fn build_prp_contiguous(base: PhysAddr, transfer_size: usize) -> (PhysAddr, PhysAddr) {
+fn build_prp_contiguous(base: PhysAddr, transfer_size: usize) -> (PhysAddr, PhysAddr, Option<DmaBuf>) {
     let page_size: u64 = 4096;
     let num_pages = (transfer_size as u64 + page_size - 1) / page_size;
 
@@ -188,11 +181,8 @@ fn build_prp_contiguous(base: PhysAddr, transfer_size: usize) -> (PhysAddr, Phys
 
     let prp2 = prp_list.phys_addr();
 
-    // Leak the PRP list — it must survive until the command completes.
-    // TODO: proper lifecycle management via a PRP list pool.
-    core::mem::forget(prp_list);
-
-    (base, prp2)
+    // Return the PRP list — caller keeps it alive until command completes.
+    (base, prp2, Some(prp_list))
 }
 
 /// NVMe command wrapper for the public API.

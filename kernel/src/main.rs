@@ -137,7 +137,31 @@ pub extern "C" fn kmain() -> ! {
         }
     }
 
-    // 10. Initialize Styx namespace
+    // 10. Scan PCI for virtio-net controller
+    serial_println!("[pci] Scanning for virtio-net...");
+    match heavenos_kernel::drivers::virtio::net::find_virtio_net() {
+        Some(info) => {
+            serial_println!("[pci] Found virtio-net: device={:#06x} iobase={:#06x}",
+                info.device_id, info.iobase);
+            match unsafe { heavenos_kernel::drivers::virtio::net::VirtioNet::new(info.iobase) } {
+                Ok(nic) => {
+                    let mac = nic.mac();
+                    serial_println!("[virtio-net] MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+                    *heavenos_kernel::drivers::virtio::net::VIRTIO_NET.lock() = Some(nic);
+                    serial_println!("[virtio-net] Driver ready");
+                }
+                Err(e) => {
+                    serial_println!("[virtio-net] Init failed: {}", e);
+                }
+            }
+        }
+        None => {
+            serial_println!("[pci] No virtio-net device found");
+        }
+    }
+
+    // 11. Initialize Styx namespace
     let root = styx::namespace::build_root();
     let _server = styx::StyxServer::new(root);
     serial_println!("[styx] Namespace ready");
