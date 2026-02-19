@@ -44,7 +44,33 @@ pub enum StyxMsgType {
 impl StyxMsgType {
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
-            100..=127 => Some(unsafe { core::mem::transmute(v) }),
+            100 => Some(Self::Tversion),
+            101 => Some(Self::Rversion),
+            102 => Some(Self::Tauth),
+            103 => Some(Self::Rauth),
+            104 => Some(Self::Tattach),
+            105 => Some(Self::Rattach),
+            107 => Some(Self::Rerror),
+            108 => Some(Self::Tflush),
+            109 => Some(Self::Rflush),
+            110 => Some(Self::Twalk),
+            111 => Some(Self::Rwalk),
+            112 => Some(Self::Topen),
+            113 => Some(Self::Ropen),
+            114 => Some(Self::Tcreate),
+            115 => Some(Self::Rcreate),
+            116 => Some(Self::Tread),
+            117 => Some(Self::Rread),
+            118 => Some(Self::Twrite),
+            119 => Some(Self::Rwrite),
+            120 => Some(Self::Tclunk),
+            121 => Some(Self::Rclunk),
+            122 => Some(Self::Tremove),
+            123 => Some(Self::Rremove),
+            124 => Some(Self::Tstat),
+            125 => Some(Self::Rstat),
+            126 => Some(Self::Twstat),
+            127 => Some(Self::Rwstat),
             _ => None,
         }
     }
@@ -192,9 +218,15 @@ pub fn parse(data: &[u8]) -> Result<StyxMsg, ParseError> {
             Ok(StyxMsg::Tattach { tag, fid, afid, uname, aname })
         }
         StyxMsgType::Twalk => {
+            if body.len() < 10 {
+                return Err(ParseError::TooShort);
+            }
             let fid = read_u32(body, 0)?;
             let newfid = read_u32(body, 4)?;
             let nwname = u16::from_le_bytes(body[8..10].try_into().unwrap()) as usize;
+            if nwname > 16 {
+                return Err(ParseError::TooShort); // 9P2000 spec: max 16 walk elements
+            }
             let mut wnames = Vec::with_capacity(nwname);
             let mut off = 10;
             for _ in 0..nwname {
@@ -205,20 +237,32 @@ pub fn parse(data: &[u8]) -> Result<StyxMsg, ParseError> {
             Ok(StyxMsg::Twalk { tag, fid, newfid, wnames })
         }
         StyxMsgType::Topen => {
+            if body.len() < 5 {
+                return Err(ParseError::TooShort);
+            }
             let fid = read_u32(body, 0)?;
             let mode = body[4];
             Ok(StyxMsg::Topen { tag, fid, mode })
         }
         StyxMsgType::Tread => {
+            if body.len() < 16 {
+                return Err(ParseError::TooShort);
+            }
             let fid = read_u32(body, 0)?;
             let offset = u64::from_le_bytes(body[4..12].try_into().unwrap());
             let count = read_u32(body, 12)?;
             Ok(StyxMsg::Tread { tag, fid, offset, count })
         }
         StyxMsgType::Twrite => {
+            if body.len() < 16 {
+                return Err(ParseError::TooShort);
+            }
             let fid = read_u32(body, 0)?;
             let offset = u64::from_le_bytes(body[4..12].try_into().unwrap());
             let count = read_u32(body, 12)? as usize;
+            if 16 + count > body.len() {
+                return Err(ParseError::TooShort);
+            }
             let data = body[16..16 + count].to_vec();
             Ok(StyxMsg::Twrite { tag, fid, offset, data })
         }

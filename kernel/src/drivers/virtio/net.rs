@@ -70,6 +70,8 @@ pub struct VirtioNet {
     mac: [u8; 6],
     /// Pre-allocated receive buffers.
     rx_buffers: Vec<DmaBuf>,
+    /// In-flight TX buffers awaiting device completion.
+    tx_inflight: Vec<Option<DmaBuf>>,
 }
 
 unsafe impl Send for VirtioNet {}
@@ -128,6 +130,7 @@ impl VirtioNet {
             tx_queue,
             mac,
             rx_buffers: Vec::new(),
+            tx_inflight: Vec::new(),
         };
 
         // 8. Pre-allocate and post receive buffers
@@ -182,8 +185,22 @@ impl VirtioNet {
         Ok(())
     }
 
+    /// Reclaim completed TX buffers from the device.
+    fn reclaim_tx_buffers(&mut self) {
+        while let Some((desc_idx, _len)) = self.tx_queue.poll_used() {
+            let idx = desc_idx as usize;
+            if idx < self.tx_inflight.len() {
+                // Drop the buffer, freeing the DMA memory
+                self.tx_inflight[idx] = None;
+            }
+        }
+    }
+
     /// Transmit an Ethernet frame. Prepends the virtio-net header.
     pub fn transmit(&mut self, frame: &[u8]) -> Result<(), VirtioNetError> {
+        // Reclaim any completed TX buffers first
+        self.reclaim_tx_buffers();
+
         let total_len = NET_HDR_SIZE + frame.len();
         let mut buf = DmaBuf::alloc(total_len).map_err(|_| VirtioNetError::OutOfMemory)?;
 
@@ -204,12 +221,15 @@ impl VirtioNet {
         let phys = buf.phys_addr();
 
         match self.tx_queue.add_buf(phys, total_len as u32, false) {
-            Some(_) => {
+            Some(desc_idx) => {
                 // Notify device (write to queue notify register)
                 self.notify_tx();
-                // Leak the buf — it'll be reclaimed when the device returns it
-                // TODO: proper tx completion tracking
-                core::mem::forget(buf);
+                // Track the buffer so it's freed when the device returns it
+                let idx = desc_idx as usize;
+                if idx >= self.tx_inflight.len() {
+                    self.tx_inflight.resize_with(idx + 1, || None);
+                }
+                self.tx_inflight[idx] = Some(buf);
                 Ok(())
             }
             None => Err(VirtioNetError::QueueFull),

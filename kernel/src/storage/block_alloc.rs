@@ -260,18 +260,18 @@ impl BlockAllocator {
 
     /// Free `count` blocks starting at data-block index `start`.
     pub fn free(&mut self, start: u64, count: u64) {
+        let mut freed = 0u64;
         for i in 0..count {
             let idx = start + i;
             let word = (idx / 64) as usize;
             let bit = (idx % 64) as u32;
-            debug_assert!(
-                self.bitmap[word] & (1u64 << bit) != 0,
-                "double free of block {}",
-                idx
-            );
-            self.bitmap[word] &= !(1u64 << bit);
+            if word < self.bitmap.len() && self.bitmap[word] & (1u64 << bit) != 0 {
+                self.bitmap[word] &= !(1u64 << bit);
+                freed += 1;
+            }
+            // Silently skip already-free blocks to prevent double-free corruption
         }
-        self.free_count += count;
+        self.free_count += freed;
         self.dirty = true;
     }
 

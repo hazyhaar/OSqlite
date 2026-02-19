@@ -76,10 +76,18 @@ pub fn claude_request<F>(
 where
     F: Fn(&str),
 {
-    // 1. Build the HTTP request
+    // 1. Validate inputs — reject CRLF to prevent header injection
+    if config.model.contains('\r') || config.model.contains('\n') {
+        return Err(ApiError::SendFailed);
+    }
+    if config.api_key.contains('\r') || config.api_key.contains('\n') {
+        return Err(ApiError::SendFailed);
+    }
+
+    // Build the HTTP request
     let body = format!(
         r#"{{"model":"{}","max_tokens":1024,"stream":true,"messages":[{{"role":"user","content":"{}"}}]}}"#,
-        config.model,
+        escape_json(&config.model),
         escape_json(prompt),
     );
 
@@ -247,15 +255,31 @@ fn escape_json(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
-            '"' => out.push_str(r#"\""#),
-            '\\' => out.push_str(r#"\\"#),
-            '\n' => out.push_str(r#"\n"#),
-            '\r' => out.push_str(r#"\r"#),
-            '\t' => out.push_str(r#"\t"#),
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0C}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => {
+                // Escape remaining control characters as \u00XX
+                let code = c as u32;
+                out.push_str("\\u00");
+                out.push(hex_digit((code >> 4) as u8));
+                out.push(hex_digit((code & 0xF) as u8));
+            }
             c => out.push(c),
         }
     }
     out
+}
+
+fn hex_digit(n: u8) -> char {
+    match n {
+        0..=9 => (b'0' + n) as char,
+        _ => (b'a' + n - 10) as char,
+    }
 }
 
 /// Unescape a JSON string value.
@@ -268,8 +292,32 @@ fn unescape_json(s: &str) -> String {
                 Some('n') => out.push('\n'),
                 Some('r') => out.push('\r'),
                 Some('t') => out.push('\t'),
+                Some('b') => out.push('\u{08}'),
+                Some('f') => out.push('\u{0C}'),
                 Some('"') => out.push('"'),
                 Some('\\') => out.push('\\'),
+                Some('/') => out.push('/'),
+                Some('u') => {
+                    // Parse 4 hex digits
+                    let mut code = 0u32;
+                    for _ in 0..4 {
+                        let d = match chars.next() {
+                            Some(h) => {
+                                match h {
+                                    '0'..='9' => h as u32 - '0' as u32,
+                                    'a'..='f' => h as u32 - 'a' as u32 + 10,
+                                    'A'..='F' => h as u32 - 'A' as u32 + 10,
+                                    _ => 0,
+                                }
+                            }
+                            None => 0,
+                        };
+                        code = (code << 4) | d;
+                    }
+                    if let Some(ch) = char::from_u32(code) {
+                        out.push(ch);
+                    }
+                }
                 Some(c) => { out.push('\\'); out.push(c); }
                 None => out.push('\\'),
             }

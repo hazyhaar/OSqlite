@@ -9,6 +9,9 @@ use super::namespace::Node;
 /// Maximum message size negotiated in Tversion.
 const MAX_MSIZE: u32 = 65536;
 
+/// Maximum number of simultaneous fids to prevent resource exhaustion.
+const MAX_FIDS: usize = 256;
+
 /// A fid tracks an open reference to a node in the namespace.
 struct Fid {
     /// Path from root to reach this node (for walking).
@@ -68,6 +71,9 @@ impl StyxServer {
             }
 
             StyxMsg::Tattach { tag, fid, .. } => {
+                if self.fids.len() >= MAX_FIDS {
+                    return self.error(tag, "too many fids");
+                }
                 self.fids.insert(fid, Fid {
                     path: Vec::new(), // root
                     open: false,
@@ -102,6 +108,11 @@ impl StyxServer {
                     }
                 }
 
+                if fid != newfid {
+                    if self.fids.len() >= MAX_FIDS {
+                        return self.error(tag, "too many fids");
+                    }
+                }
                 self.fids.insert(newfid, Fid {
                     path: current_path,
                     open: false,
@@ -134,6 +145,11 @@ impl StyxServer {
             }
 
             StyxMsg::Tread { tag, fid, offset, count } => {
+                match self.fids.get(&fid) {
+                    Some(f) if !f.open => return self.error(tag, "fid not open"),
+                    None => return self.error(tag, "unknown fid"),
+                    _ => {}
+                }
                 let node = match self.fid_to_node(&fid) {
                     Some(n) => n,
                     None => return self.error(tag, "unknown fid"),
@@ -154,6 +170,11 @@ impl StyxServer {
             }
 
             StyxMsg::Twrite { tag, fid, data, .. } => {
+                match self.fids.get(&fid) {
+                    Some(f) if !f.open => return self.error(tag, "fid not open"),
+                    None => return self.error(tag, "unknown fid"),
+                    _ => {}
+                }
                 let node = match self.fid_to_node_mut(&fid) {
                     Some(n) => n,
                     None => return self.error(tag, "unknown fid"),

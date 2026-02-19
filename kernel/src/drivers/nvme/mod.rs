@@ -7,6 +7,7 @@ pub mod pci;
 pub use command::{NvmeCommand, AdminOpcode, NvmOpcode, NvmeError};
 pub use queue::{SubmissionEntry, CompletionEntry};
 
+use core::sync::atomic::{compiler_fence, Ordering};
 use spin::Mutex;
 use crate::mem::DmaBuf;
 use queue::{QueuePair, AdminQueue};
@@ -201,6 +202,7 @@ impl NvmeDriver {
         _buf: &mut DmaBuf,
     ) -> Result<u16, NvmeError> {
         self.admin_queue.submit(cmd);
+        compiler_fence(Ordering::SeqCst);
         self.ring_admin_sq_doorbell();
 
         // Spin-wait for completion
@@ -218,6 +220,7 @@ impl NvmeDriver {
         cmd: SubmissionEntry,
     ) -> Result<u16, NvmeError> {
         self.admin_queue.submit(cmd);
+        compiler_fence(Ordering::SeqCst);
         self.ring_admin_sq_doorbell();
 
         loop {
@@ -257,6 +260,7 @@ impl NvmeDriver {
 
         let cmd = SubmissionEntry::read(nsid, lba, block_count - 1, prp1, prp2);
         qp.submit(cmd);
+        compiler_fence(Ordering::SeqCst);
         let sq_tail = qp.sq_tail();
         unsafe { Self::write_doorbell(bar0, regs::SQ0TDBL + (2 * qid) * stride, sq_tail as u32) };
 
@@ -294,6 +298,7 @@ impl NvmeDriver {
 
         let cmd = SubmissionEntry::write(nsid, lba, block_count - 1, prp1, prp2);
         qp.submit(cmd);
+        compiler_fence(Ordering::SeqCst);
         let sq_tail = qp.sq_tail();
         unsafe { Self::write_doorbell(bar0, regs::SQ0TDBL + (2 * qid) * stride, sq_tail as u32) };
 
@@ -322,6 +327,7 @@ impl NvmeDriver {
 
         let cmd = SubmissionEntry::flush(nsid);
         qp.submit(cmd);
+        compiler_fence(Ordering::SeqCst);
         let sq_tail = qp.sq_tail();
         unsafe { Self::write_doorbell(bar0, regs::SQ0TDBL + (2 * qid) * stride, sq_tail as u32) };
 

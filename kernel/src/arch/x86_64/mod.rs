@@ -7,7 +7,9 @@
 /// - Interrupt descriptor table (IDT) skeleton
 pub mod serial;
 pub mod cpu;
+pub mod gdt;
 pub mod idt;
+pub mod pic;
 
 /// Halt the CPU until the next interrupt.
 #[inline(always)]

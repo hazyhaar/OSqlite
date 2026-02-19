@@ -85,12 +85,13 @@ impl LineEditor {
 
                 // Escape sequences (arrow keys etc.) — consume and ignore
                 0x1B => {
-                    // Read the rest of the escape sequence
-                    let serial = SERIAL.lock();
-                    if let Some(b'[') = serial.try_read_byte() {
-                        // CSI sequence — read until a letter
-                        loop {
-                            let c = serial.read_byte();
+                    // Read the rest of the escape sequence without holding the lock
+                    // across blocking reads (which would deadlock).
+                    let maybe_bracket = SERIAL.lock().try_read_byte();
+                    if let Some(b'[') = maybe_bracket {
+                        // CSI sequence — read until a letter or ~ (max 8 bytes to prevent hang)
+                        for _ in 0..8 {
+                            let c = SERIAL.lock().read_byte();
                             if c.is_ascii_alphabetic() || c == b'~' {
                                 break;
                             }

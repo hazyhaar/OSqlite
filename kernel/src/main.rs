@@ -26,7 +26,15 @@ pub extern "C" fn _start() -> ! {
     serial::SERIAL.lock().init();
     serial_println!("HeavenOS v0.1.0 — booting...");
 
-    // 2. Initialize physical memory allocator
+    // 2. Initialize GDT, PIC, and IDT (must be done before any exception can fire)
+    unsafe { x86_64::gdt::init(); }
+    serial_println!("[cpu] GDT loaded");
+    unsafe { x86_64::pic::init(); }
+    serial_println!("[cpu] PIC remapped (IRQs masked)");
+    unsafe { x86_64::idt::init(); }
+    serial_println!("[cpu] IDT loaded (exception handlers active)");
+
+    // 3. Initialize physical memory allocator
     // TODO: parse memory map from bootloader
     // For now, hardcode a 128 MB region starting at 1 MB
     let memory_regions = [(0x100000u64, 128 * 1024 * 1024u64)];

@@ -274,16 +274,63 @@ impl HeavenVfs {
 
         // Grow file if needed
         if start_block + block_count > file.block_count {
-            let _extra = start_block + block_count - file.block_count;
-            let alloc = self.allocator.lock();
-            // TODO: handle relocation if grow fails due to contiguity
-            // For now, we assume the file was allocated with enough slack
-            // or we return SQLITE_FULL
-            let _ = alloc; // Growth would require relocating the file
-            if start_block + block_count > file.block_count {
-                // Simple case: try to allocate adjacent blocks
-                // This is a simplification — real implementation needs relocation
-                return SQLITE_FULL;
+            let needed = start_block + block_count;
+            let extra = needed - file.block_count;
+            let mut alloc = self.allocator.lock();
+
+            // Try to allocate a new contiguous region and relocate
+            match alloc.alloc(needed) {
+                Ok(new_start_block) => {
+                    // Got a larger region — copy old data, free old blocks
+                    let old_data_start = file.start_lba;
+                    let new_data_start = alloc.data_start_lba() + new_start_block;
+
+                    // We need NVMe to copy blocks
+                    let mut nvme_guard = NVME.lock();
+                    let nvme = match nvme_guard.as_mut() {
+                        Some(n) => n,
+                        None => return SQLITE_IOERR,
+                    };
+
+                    // Copy existing blocks one at a time
+                    let copy_bs = file.block_size as usize;
+                    if let Ok(mut tmp) = DmaBuf::alloc(copy_bs) {
+                        for blk in 0..file.block_count {
+                            if nvme.read_blocks(old_data_start + blk, 1, &mut tmp).is_err() {
+                                // Rollback: free new allocation
+                                alloc.free(new_start_block, needed);
+                                return SQLITE_IOERR_READ;
+                            }
+                            if nvme.write_blocks(new_data_start + blk, 1, &tmp).is_err() {
+                                alloc.free(new_start_block, needed);
+                                return SQLITE_IOERR_WRITE;
+                            }
+                        }
+                    } else {
+                        alloc.free(new_start_block, needed);
+                        return SQLITE_IOERR_NOMEM;
+                    }
+                    drop(nvme_guard);
+
+                    // Free old blocks (using data-block-relative index)
+                    let old_start_block = file.start_lba - alloc.data_start_lba();
+                    alloc.free(old_start_block, file.block_count);
+
+                    // Update file metadata
+                    file.start_lba = new_data_start;
+                    file.block_count = needed;
+
+                    // Update file table
+                    let mut ft = self.file_table.lock();
+                    if let Some(entry) = ft.get_mut(file.file_table_index) {
+                        entry.start_block = new_start_block;
+                        entry.block_count = needed;
+                    }
+                }
+                Err(_) => {
+                    let _ = extra; // suppress unused warning
+                    return SQLITE_FULL;
+                }
             }
         }
 
@@ -350,38 +397,34 @@ impl HeavenVfs {
     /// Without the NVMe Flush command, the device's volatile write cache
     /// may reorder or lose writes on power loss.
     pub fn sync(&self, file: &HeavenFile) -> c_int {
-        // 1. Update file table entry
-        {
-            let mut ft = self.file_table.lock();
-            if let Some(entry) = ft.get_mut(file.file_table_index) {
-                entry.byte_length = file.byte_length;
-            }
-        }
-
+        // Hold all three locks for the entire sync to ensure atomicity.
+        // Lock order: NVME → allocator → file_table (consistent to prevent deadlock).
         let mut nvme_guard = NVME.lock();
         let nvme = match nvme_guard.as_mut() {
             Some(n) => n,
             None => return SQLITE_IOERR_FSYNC,
         };
 
+        let mut alloc = self.allocator.lock();
+        let mut ft = self.file_table.lock();
+
+        // 1. Update file table entry
+        if let Some(entry) = ft.get_mut(file.file_table_index) {
+            entry.byte_length = file.byte_length;
+        }
+
         // 2. Flush block allocator bitmap to disk
-        {
-            let mut alloc = self.allocator.lock();
-            if let Err(_) = alloc.flush(nvme) {
-                return SQLITE_IOERR_FSYNC;
-            }
+        if alloc.flush(nvme).is_err() {
+            return SQLITE_IOERR_FSYNC;
         }
 
         // 3. Flush file table to disk
-        {
-            let mut ft = self.file_table.lock();
-            if let Err(_) = ft.flush(nvme) {
-                return SQLITE_IOERR_FSYNC;
-            }
+        if ft.flush(nvme).is_err() {
+            return SQLITE_IOERR_FSYNC;
         }
 
         // 4. NVMe Flush — the critical barrier
-        if let Err(_) = nvme.flush() {
+        if nvme.flush().is_err() {
             return SQLITE_IOERR_FSYNC;
         }
 

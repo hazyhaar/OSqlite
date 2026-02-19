@@ -152,14 +152,24 @@ pub fn build_prp(buf: &DmaBuf, transfer_size: usize) -> (PhysAddr, PhysAddr) {
 }
 
 /// Build PRP list for a contiguous buffer spanning > 2 pages.
+///
+/// # Panics
+/// Panics if transfer requires > 512 PRP entries (> 2 MiB).
+/// NVMe spec: a PRP list must fit within a single page (512 entries max).
 fn build_prp_contiguous(base: PhysAddr, transfer_size: usize) -> (PhysAddr, PhysAddr) {
     let page_size: u64 = 4096;
     let num_pages = (transfer_size as u64 + page_size - 1) / page_size;
 
-    // Allocate a page for the PRP list itself.
-    // Each entry is a u64 (8 bytes), so one page holds 512 entries.
-    // That's enough for 512 * 4096 = 2 MB transfers.
-    let prp_list = DmaBuf::alloc(page_size as usize)
+    // PRP list entries = num_pages - 1 (page 0 goes in PRP1).
+    // One 4 KiB page holds 512 u64 entries.
+    assert!(
+        num_pages - 1 <= 512,
+        "transfer too large for single PRP list page ({} pages, max 513)",
+        num_pages
+    );
+
+    // Allocate a page-aligned page for the PRP list.
+    let prp_list = DmaBuf::alloc_aligned(page_size as usize, 1)
         .expect("failed to allocate PRP list page");
 
     let list_ptr = prp_list.as_mut_ptr() as *mut u64;

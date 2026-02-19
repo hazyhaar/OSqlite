@@ -5,6 +5,7 @@
 /// - TCP socket creation and I/O
 /// - DNS resolution (static for now — api.anthropic.com hardcoded)
 use alloc::vec;
+use core::sync::atomic::{AtomicU16, Ordering};
 
 use smoltcp::iface::{Config, Interface, SocketSet, SocketHandle};
 use smoltcp::socket::tcp::{self, Socket as TcpSocket};
@@ -12,6 +13,9 @@ use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr};
 
 use super::device::SmoltcpDevice;
+
+/// Monotonic ephemeral port counter (wraps within 49152..65535 range).
+static EPHEMERAL_PORT: AtomicU16 = AtomicU16::new(49152);
 
 /// Network stack state.
 pub struct NetStack {
@@ -84,8 +88,9 @@ impl NetStack {
 
         let handle = self.sockets.add(socket);
 
-        // Pick an ephemeral local port
-        let local_port = 49152 + (Self::now().total_millis() as u16 % 16384);
+        // Pick an ephemeral local port from monotonic counter
+        let port_offset = EPHEMERAL_PORT.fetch_add(1, Ordering::Relaxed);
+        let local_port = 49152 + (port_offset % 16384);
 
         let socket = self.sockets.get_mut::<TcpSocket>(handle);
         socket.connect(

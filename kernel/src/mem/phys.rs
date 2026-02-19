@@ -197,11 +197,10 @@ impl PhysPageAllocator {
             if page < MAX_PAGES {
                 let word = page / 64;
                 let bit = page % 64;
-                debug_assert!(
-                    inner.bitmap[word] & (1 << bit) != 0,
-                    "double free of page {:#x}",
-                    page * PAGE_SIZE
-                );
+                if inner.bitmap[word] & (1 << bit) == 0 {
+                    // Already free — silently ignore to prevent double-free corruption
+                    continue;
+                }
                 inner.bitmap[word] &= !(1 << bit);
                 inner.free_pages += 1;
             }
