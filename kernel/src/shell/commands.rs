@@ -9,6 +9,13 @@ use crate::{serial_print, serial_println};
 use crate::mem::phys::PHYS_ALLOCATOR;
 use crate::drivers::nvme::NVME;
 
+use spin::Mutex;
+use smoltcp::wire::Ipv4Address;
+
+/// Stored IP for api.anthropic.com (set via `resolve` command).
+/// Without DNS, the user must provide this. Default: 0.0.0.0 (not set).
+static API_TARGET_IP: Mutex<Ipv4Address> = Mutex::new(Ipv4Address::new(0, 0, 0, 0));
+
 /// Dispatch a command line to the appropriate handler.
 pub fn dispatch(line: &str) {
     let mut parts = line.split_whitespace();
@@ -45,8 +52,20 @@ pub fn dispatch(line: &str) {
             if rest.is_empty() {
                 serial_println!("usage: ask <prompt>");
             } else {
-                cmd_ask(&rest);
+                cmd_ask(&rest, true);
             }
+        }
+        "askp" => {
+            let rest: alloc::string::String = parts.collect::<alloc::vec::Vec<&str>>().join(" ");
+            if rest.is_empty() {
+                serial_println!("usage: askp <prompt>  (proxy mode)");
+            } else {
+                cmd_ask(&rest, false);
+            }
+        }
+        "resolve" => {
+            let rest: alloc::string::String = parts.collect::<alloc::vec::Vec<&str>>().join("");
+            cmd_resolve(&rest);
         }
         "model" => {
             if let Some(name) = parts.next() {
@@ -89,9 +108,11 @@ fn cmd_help() {
     serial_println!("  sql <stmt>    execute SQL on the system database");
     serial_println!();
     serial_println!("Claude API:");
-    serial_println!("  apikey <key>  set Anthropic API key");
-    serial_println!("  ask <prompt>  send a message to Claude");
-    serial_println!("  model <name>  set model (default: claude-sonnet-4-5-20250929)");
+    serial_println!("  apikey <key>     set Anthropic API key");
+    serial_println!("  resolve <ip>     set api.anthropic.com IP for TLS mode");
+    serial_println!("  ask <prompt>     send message via TLS (direct HTTPS)");
+    serial_println!("  askp <prompt>    send message via proxy (plain HTTP)");
+    serial_println!("  model <name>     set model (default: claude-sonnet-4-5-20250929)");
     serial_println!();
     serial_println!("  clear         clear screen");
     serial_println!("  panic         trigger a kernel panic (for testing)");
@@ -255,7 +276,41 @@ fn cmd_apikey(key: &str) {
     }
 }
 
-fn cmd_ask(prompt: &str) {
+fn cmd_resolve(ip_str: &str) {
+    if ip_str.is_empty() {
+        let current = *API_TARGET_IP.lock();
+        if current == Ipv4Address::new(0, 0, 0, 0) {
+            serial_println!("API target: not set");
+            serial_println!("usage: resolve <ip>  (e.g. resolve 104.18.37.202)");
+            serial_println!("  Get IP: dig +short api.anthropic.com");
+        } else {
+            serial_println!("API target: {}", current);
+        }
+        return;
+    }
+
+    // Parse IPv4 address
+    let octets: alloc::vec::Vec<&str> = ip_str.split('.').collect();
+    if octets.len() != 4 {
+        serial_println!("Invalid IP format. Use: resolve 1.2.3.4");
+        return;
+    }
+    let mut bytes = [0u8; 4];
+    for (i, octet) in octets.iter().enumerate() {
+        match octet.parse::<u8>() {
+            Ok(b) => bytes[i] = b,
+            Err(_) => {
+                serial_println!("Invalid IP octet: {}", octet);
+                return;
+            }
+        }
+    }
+    let ip = Ipv4Address::new(bytes[0], bytes[1], bytes[2], bytes[3]);
+    *API_TARGET_IP.lock() = ip;
+    serial_println!("API target set to: {}", ip);
+}
+
+fn cmd_ask(prompt: &str, use_tls: bool) {
     // Check API key
     let api_key = match crate::api::get_api_key() {
         Some(k) => k,
@@ -276,13 +331,28 @@ fn cmd_ask(prompt: &str) {
         }
     };
 
-    // Build config
-    let config = crate::api::ClaudeConfig {
-        api_key,
-        ..crate::api::ClaudeConfig::default_proxy()
+    // Build config based on mode
+    let config = if use_tls {
+        let target_ip = *API_TARGET_IP.lock();
+        if target_ip == Ipv4Address::new(0, 0, 0, 0) {
+            serial_println!("Error: API IP not set. Run: resolve <ip>");
+            serial_println!("  Get IP on host: dig +short api.anthropic.com");
+            serial_println!("  Or use 'askp' for proxy mode.");
+            return;
+        }
+        serial_println!("[TLS to {}:443...]", target_ip);
+        crate::api::ClaudeConfig {
+            api_key,
+            ..crate::api::ClaudeConfig::direct_tls(target_ip)
+        }
+    } else {
+        serial_println!("[proxy mode: 10.0.2.2:8080...]");
+        crate::api::ClaudeConfig {
+            api_key,
+            ..crate::api::ClaudeConfig::default_proxy()
+        }
     };
 
-    serial_println!("[connecting to Claude API via proxy at 10.0.2.2:8080...]");
     serial_println!();
 
     // Send request and stream response
@@ -295,13 +365,18 @@ fn cmd_ask(prompt: &str) {
         Err(e) => {
             serial_println!();
             serial_println!("[API error: {}]", e);
-            serial_println!();
-            serial_println!("Ensure QEMU runs with:");
-            serial_println!("  -device virtio-net-pci,netdev=net0");
-            serial_println!("  -netdev user,id=net0,hostfwd=tcp::8080-:80");
-            serial_println!("and a TLS proxy on the host:");
-            serial_println!("  socat TCP-LISTEN:8080,fork,reuseaddr \\");
-            serial_println!("    OPENSSL:api.anthropic.com:443");
+            if use_tls {
+                serial_println!();
+                serial_println!("TLS troubleshooting:");
+                serial_println!("  1. Verify QEMU has internet: -netdev user,id=net0");
+                serial_println!("  2. Verify IP: resolve <current-ip-of-api.anthropic.com>");
+                serial_println!("  3. Fallback: askp <prompt> (uses socat proxy)");
+            } else {
+                serial_println!();
+                serial_println!("Proxy troubleshooting:");
+                serial_println!("  socat TCP-LISTEN:8080,fork,reuseaddr \\");
+                serial_println!("    OPENSSL:api.anthropic.com:443");
+            }
         }
     }
 }

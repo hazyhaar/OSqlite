@@ -10,6 +10,7 @@
 ///   TCP sockets (used by HTTP client, TLS, etc.)
 mod device;
 pub mod stack;
+pub mod tls;
 
 pub use stack::NetStack;
 
