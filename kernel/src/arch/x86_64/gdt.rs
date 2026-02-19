@@ -1,9 +1,20 @@
-/// Global Descriptor Table (GDT) — required for x86_64 long mode.
+/// Global Descriptor Table (GDT) with Task State Segment (TSS).
 ///
-/// Even though long mode ignores most segment fields, the CPU still
-/// requires a valid GDT with at least a null descriptor, a kernel
-/// code segment, and a kernel data segment.
+/// Long mode requires a valid GDT with at least null, kernel CS, and
+/// kernel DS descriptors. We also include a TSS with IST entries so
+/// the double-fault handler can use a dedicated stack, preventing
+/// triple faults on stack overflow.
 use core::mem::size_of;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// IST1 stack top — set during guard page setup, used by double fault handler.
+pub static IST1_STACK_TOP: AtomicU64 = AtomicU64::new(0);
+
+/// Guard page virtual address — used by page fault handler to detect overflow.
+pub static GUARD_PAGE_ADDR: AtomicU64 = AtomicU64::new(0);
+
+/// Kernel stack top — exported for page fault diagnostics.
+pub static KERNEL_STACK_TOP: AtomicU64 = AtomicU64::new(0);
 
 /// GDT entry (8 bytes).
 #[repr(C, packed)]
@@ -42,10 +53,53 @@ impl GdtEntry {
     }
 }
 
-/// Our GDT: null + kernel code + kernel data.
+/// Task State Segment for long mode.
+/// We only use the IST entries for alternate stacks on exceptions.
+#[repr(C, packed)]
+struct Tss {
+    _reserved0: u32,
+    rsp0: u64,
+    rsp1: u64,
+    rsp2: u64,
+    _reserved1: u64,
+    ist1: u64,
+    ist2: u64,
+    ist3: u64,
+    ist4: u64,
+    ist5: u64,
+    ist6: u64,
+    ist7: u64,
+    _reserved2: u64,
+    _reserved3: u16,
+    iopb: u16,
+}
+
+static_assertions::const_assert_eq!(size_of::<Tss>(), 104);
+
+/// Static TSS — zeroed initially, IST1 set during boot.
+static mut TSS: Tss = Tss {
+    _reserved0: 0,
+    rsp0: 0,
+    rsp1: 0,
+    rsp2: 0,
+    _reserved1: 0,
+    ist1: 0,
+    ist2: 0,
+    ist3: 0,
+    ist4: 0,
+    ist5: 0,
+    ist6: 0,
+    ist7: 0,
+    _reserved2: 0,
+    _reserved3: 0,
+    iopb: size_of::<Tss>() as u16, // No I/O permission bitmap
+};
+
+/// GDT layout: null + kernel code + kernel data + TSS (16 bytes = 2 entries)
+/// TSS descriptor in long mode is 16 bytes, occupying entries 3 and 4.
 #[repr(C, align(16))]
 struct Gdt {
-    entries: [GdtEntry; 3],
+    entries: [GdtEntry; 5],
 }
 
 /// GDTR pointer for lgdt instruction.
@@ -55,11 +109,14 @@ struct GdtPointer {
     base: u64,
 }
 
-static GDT: Gdt = Gdt {
+/// Static GDT — TSS entries filled dynamically during init.
+static mut GDT: Gdt = Gdt {
     entries: [
         GdtEntry::null(),        // 0x00: null
         GdtEntry::kernel_code(), // 0x08: kernel CS
         GdtEntry::kernel_data(), // 0x10: kernel DS
+        GdtEntry::null(),        // 0x18: TSS low (set in init)
+        GdtEntry::null(),        // 0x20: TSS high (set in init)
     ],
 };
 
@@ -67,15 +124,54 @@ static GDT: Gdt = Gdt {
 pub const KERNEL_CS: u16 = 0x08;
 /// Kernel data segment selector.
 pub const KERNEL_DS: u16 = 0x10;
+/// TSS segment selector.
+pub const TSS_SEL: u16 = 0x18;
 
-/// Load the GDT and reload segment registers.
+/// Build the two 64-bit words for a TSS descriptor in long mode.
+///
+/// A system descriptor (TSS) in long mode is 16 bytes (128 bits):
+///   [low word]  standard 8-byte descriptor encoding
+///   [high word] upper 32 bits of base address + reserved
+fn tss_descriptor(base: u64, limit: u32) -> (u64, u64) {
+    let base_low = (base & 0xFFFF) as u64;
+    let base_mid = ((base >> 16) & 0xFF) as u64;
+    let base_high_byte = ((base >> 24) & 0xFF) as u64;
+    let base_upper = ((base >> 32) & 0xFFFF_FFFF) as u64;
+
+    let limit_low = (limit & 0xFFFF) as u64;
+    let limit_high = ((limit >> 16) & 0xF) as u64;
+
+    // Type = 0x9 (available 64-bit TSS), DPL=0, Present=1
+    let access: u64 = 0x89;
+
+    let low = limit_low
+        | (base_low << 16)
+        | (base_mid << 32)
+        | (access << 40)
+        | (limit_high << 48)
+        | (base_high_byte << 56);
+
+    let high = base_upper;
+
+    (low, high)
+}
+
+/// Load the GDT (with TSS) and reload segment registers.
 ///
 /// # Safety
 /// Must be called exactly once, early in boot, before loading the IDT.
 pub unsafe fn init() {
+    let tss_addr = &raw const TSS as u64;
+    let tss_limit = (size_of::<Tss>() - 1) as u32;
+    let (tss_low, tss_high) = tss_descriptor(tss_addr, tss_limit);
+
+    // Fill TSS descriptor entries in the GDT
+    GDT.entries[3] = GdtEntry(tss_low);
+    GDT.entries[4] = GdtEntry(tss_high);
+
     let ptr = GdtPointer {
         limit: (size_of::<Gdt>() - 1) as u16,
-        base: &GDT as *const _ as u64,
+        base: &raw const GDT as u64,
     };
 
     core::arch::asm!(
@@ -102,4 +198,21 @@ pub unsafe fn init() {
         tmp = lateout(reg) _,
         options(preserves_flags),
     );
+
+    // Load the TSS
+    core::arch::asm!(
+        "ltr {sel:x}",
+        sel = in(reg) TSS_SEL,
+        options(nostack, preserves_flags),
+    );
+}
+
+/// Set up the IST1 stack for the double-fault handler.
+///
+/// # Safety
+/// Must be called after the physical allocator is initialized and before
+/// any code that could cause a double fault.
+pub unsafe fn set_ist1(stack_top: u64) {
+    TSS.ist1 = stack_top;
+    IST1_STACK_TOP.store(stack_top, Ordering::Release);
 }

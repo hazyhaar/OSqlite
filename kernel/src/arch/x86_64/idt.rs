@@ -9,10 +9,11 @@
 /// - #BR (5)  Bound range exceeded
 /// - #UD (6)  Invalid opcode
 /// - #NM (7)  Device not available
-/// - #DF (8)  Double fault (uses IST1 if available)
+/// - #DF (8)  Double fault (uses IST1 for safe stack)
 /// - #GP (13) General protection fault
-/// - #PF (14) Page fault
+/// - #PF (14) Page fault (detects guard page = stack overflow)
 use super::gdt;
+use core::sync::atomic::Ordering;
 
 /// IDT entry (16 bytes on x86_64).
 #[repr(C, packed)]
@@ -46,6 +47,19 @@ impl IdtEntry {
             offset_low: handler as u16,
             selector: gdt::KERNEL_CS,
             ist: 0,
+            type_attr: 0x8E, // present | interrupt gate | DPL=0
+            offset_mid: (handler >> 16) as u16,
+            offset_high: (handler >> 32) as u32,
+            _reserved: 0,
+        }
+    }
+
+    /// Create an interrupt gate that uses IST entry `ist_index` (1-7).
+    pub fn interrupt_gate_ist(handler: u64, ist_index: u8) -> Self {
+        Self {
+            offset_low: handler as u16,
+            selector: gdt::KERNEL_CS,
+            ist: ist_index & 0x7,
             type_attr: 0x8E, // present | interrupt gate | DPL=0
             offset_mid: (handler >> 16) as u16,
             offset_high: (handler >> 32) as u32,
@@ -119,7 +133,9 @@ pub unsafe fn init() {
         idt.entries[5]  = IdtEntry::interrupt_gate(isr_br as *const () as u64);
         idt.entries[6]  = IdtEntry::interrupt_gate(isr_ud as *const () as u64);
         idt.entries[7]  = IdtEntry::interrupt_gate(isr_nm as *const () as u64);
-        idt.entries[8]  = IdtEntry::interrupt_gate(isr_df as *const () as u64);
+        // Double fault uses IST1 — runs on a separate stack so we don't
+        // triple fault when the kernel stack overflows.
+        idt.entries[8]  = IdtEntry::interrupt_gate_ist(isr_df as *const () as u64, 1);
         idt.entries[13] = IdtEntry::interrupt_gate(isr_gp as *const () as u64);
         idt.entries[14] = IdtEntry::interrupt_gate(isr_pf as *const () as u64);
 
@@ -147,12 +163,7 @@ pub struct InterruptFrame {
     pub ss: u64,
 }
 
-// ---- Exception handlers (naked asm stubs that call Rust functions) ----
-
-// For exceptions WITHOUT error code: CPU pushes RIP, CS, RFLAGS, RSP, SS.
-// For exceptions WITH error code: CPU also pushes an error code before RIP.
-//
-// We use extern "x86-interrupt" calling convention which handles all of this.
+// ---- Exception handlers ----
 
 extern "x86-interrupt" fn isr_de(frame: InterruptFrame) {
     exception_handler("Division by zero (#DE)", &frame, None);
@@ -188,7 +199,21 @@ extern "x86-interrupt" fn isr_nm(frame: InterruptFrame) {
 }
 
 extern "x86-interrupt" fn isr_df(frame: InterruptFrame, error_code: u64) {
-    exception_handler("Double fault (#DF)", &frame, Some(error_code));
+    // Double fault — running on IST1 stack (separate from the faulting stack).
+    crate::serial_println!("!!! DOUBLE FAULT (running on IST1 stack) !!!");
+    crate::serial_println!("  Error code: {:#x}", error_code);
+    crate::serial_println!("  RIP:     {:#x}", frame.rip);
+    crate::serial_println!("  RSP:     {:#x}", frame.rsp);
+
+    let guard = gdt::GUARD_PAGE_ADDR.load(Ordering::Relaxed);
+    if guard != 0 {
+        let stack_top = gdt::KERNEL_STACK_TOP.load(Ordering::Relaxed);
+        crate::serial_println!("  Guard page: {:#x}, Stack top: {:#x}", guard, stack_top);
+        if frame.rsp >= guard && frame.rsp < guard + 4096 {
+            crate::serial_println!("  >>> KERNEL STACK OVERFLOW DETECTED <<<");
+        }
+    }
+
     // Double fault is unrecoverable
     loop { crate::arch::x86_64::hlt(); }
 }
@@ -201,6 +226,24 @@ extern "x86-interrupt" fn isr_pf(frame: InterruptFrame, error_code: u64) {
     // Read CR2 for the faulting address
     let cr2: u64;
     unsafe { core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nostack, nomem)); }
+
+    // Check if this is a stack guard page hit
+    let guard = gdt::GUARD_PAGE_ADDR.load(Ordering::Relaxed);
+    if guard != 0 && cr2 >= guard && cr2 < guard + 4096 {
+        crate::serial_println!("!!! KERNEL STACK OVERFLOW !!!");
+        crate::serial_println!("  Stack hit guard page at {:#x}", guard);
+        crate::serial_println!("  Faulting address: {:#x}", cr2);
+        crate::serial_println!("  RIP:     {:#x}", frame.rip);
+        crate::serial_println!("  RSP:     {:#x}", frame.rsp);
+        let stack_top = gdt::KERNEL_STACK_TOP.load(Ordering::Relaxed);
+        if stack_top != 0 {
+            crate::serial_println!("  Stack used: ~{} bytes (of {} available)",
+                stack_top - frame.rsp,
+                stack_top - guard - 4096);
+        }
+        loop { crate::arch::x86_64::hlt(); }
+    }
+
     crate::serial_println!("!!! PAGE FAULT !!!");
     crate::serial_println!("  Address: {:#x}", cr2);
     crate::serial_println!("  Error:   {:#x}", error_code);

@@ -101,6 +101,62 @@ pub extern "C" fn kmain() -> ! {
     serial_println!("[mem] Physical allocator: {} pages free",
         mem::phys::PHYS_ALLOCATOR.free_count());
 
+    // 5b. Set up IST1 stack for double-fault handler (4 KiB)
+    // This must happen before any code that could overflow the stack.
+    unsafe {
+        let ist_phys = mem::phys::PHYS_ALLOCATOR
+            .alloc_pages_contiguous(1, 1)
+            .expect("failed to allocate IST1 stack");
+        let ist_top = ist_phys.as_u64() + mem::hhdm_offset() + 4096;
+        x86_64::gdt::set_ist1(ist_top);
+        serial_println!("[cpu] IST1 stack at {:#x}", ist_top);
+    }
+
+    // 5c. Allocate a guarded kernel stack and switch to it.
+    // Layout: [guard page (unmapped)] [16 usable pages = 64 KiB]
+    // The guard page triggers a page fault on stack overflow instead of
+    // silently corrupting memory.
+    unsafe {
+        use core::sync::atomic::Ordering;
+        match mem::paging::alloc_guarded_stack(16) {
+            Some((guard_vaddr, stack_top)) => {
+                x86_64::gdt::GUARD_PAGE_ADDR.store(guard_vaddr, Ordering::Release);
+                x86_64::gdt::KERNEL_STACK_TOP.store(stack_top, Ordering::Release);
+                serial_println!("[mem] Kernel stack: {:#x}..{:#x} (guard at {:#x})",
+                    guard_vaddr + 4096, stack_top, guard_vaddr);
+
+                // Switch RSP to the new stack and continue boot there.
+                // We pass `continue_boot` as a function pointer; the trampoline
+                // sets RSP and calls it. This is a one-way jump — we never
+                // return to Limine's stack.
+                switch_stack(stack_top, continue_boot as *const () as u64);
+            }
+            None => {
+                serial_println!("[mem] WARNING: Could not allocate guarded stack, using Limine stack");
+                continue_boot();
+            }
+        }
+    }
+}
+
+/// Switch to a new stack and call the continuation function.
+/// This is a one-way operation — the continuation must diverge (-> !).
+///
+/// # Safety
+/// `new_stack_top` must point to the top of a valid, mapped stack region.
+unsafe fn switch_stack(new_stack_top: u64, continuation: u64) -> ! {
+    core::arch::asm!(
+        "mov rsp, {stack}",
+        "call {func}",
+        "ud2",  // Should never reach here
+        stack = in(reg) new_stack_top,
+        func = in(reg) continuation,
+        options(noreturn),
+    );
+}
+
+/// Continue boot after switching to the guarded kernel stack.
+fn continue_boot() -> ! {
     // 6. Check CPU features
     serial_println!("[cpu] RDRAND: {}", x86_64::cpu::has_rdrand());
     serial_println!("[cpu] CLFLUSHOPT: {}", x86_64::cpu::has_clflushopt());

@@ -1,4 +1,5 @@
 pub mod phys;
+pub mod paging;
 mod dma;
 mod heap;
 
