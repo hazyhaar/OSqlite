@@ -135,9 +135,10 @@ impl HeavenVfs {
     // ---- xOpen ----
 
     /// Open a file. Creates it if SQLITE_OPEN_CREATE is set and it doesn't exist.
+    /// Lock order: allocator → file_table (NVME not needed here).
     pub fn open(&self, name: &[u8], flags: c_int) -> Result<HeavenFile, c_int> {
-        let mut ft = self.file_table.lock();
         let mut alloc = self.allocator.lock();
+        let mut ft = self.file_table.lock();
 
         let block_size = alloc.block_size();
 
@@ -272,10 +273,19 @@ impl HeavenVfs {
         let end_block = (offset + amount as u64 - 1) / bs;
         let block_count = end_block - start_block + 1;
 
-        // Grow file if needed
+        // Grow file if needed.
+        // Lock order: NVME → allocator → file_table.
         if start_block + block_count > file.block_count {
             let needed = start_block + block_count;
-            let extra = needed - file.block_count;
+
+            // Step 1: Take NVME lock first (consistent lock ordering).
+            let mut nvme_guard = NVME.lock();
+            let nvme = match nvme_guard.as_mut() {
+                Some(n) => n,
+                None => return SQLITE_IOERR,
+            };
+
+            // Step 2: Take allocator lock.
             let mut alloc = self.allocator.lock();
 
             // Try to allocate a new contiguous region and relocate.
@@ -292,13 +302,7 @@ impl HeavenVfs {
                     let old_block_count = file.block_count;
                     let new_data_start = alloc.data_start_lba() + new_start_block;
 
-                    // Step 2: Copy existing blocks to new region
-                    let mut nvme_guard = NVME.lock();
-                    let nvme = match nvme_guard.as_mut() {
-                        Some(n) => n,
-                        None => return SQLITE_IOERR,
-                    };
-
+                    // Copy existing blocks to new region
                     let copy_bs = file.block_size as usize;
                     if let Ok(mut tmp) = DmaBuf::alloc(copy_bs) {
                         for blk in 0..old_block_count {
@@ -316,14 +320,13 @@ impl HeavenVfs {
                         return SQLITE_IOERR_NOMEM;
                     }
 
-                    // Step 3: Flush to ensure new copies are durable
+                    // NVMe Flush to ensure new copies are durable
                     if nvme.flush().is_err() {
                         alloc.free(new_start_block, needed);
                         return SQLITE_IOERR_FSYNC;
                     }
-                    drop(nvme_guard);
 
-                    // Step 4: Update metadata BEFORE freeing old blocks
+                    // Update metadata BEFORE freeing old blocks
                     file.start_lba = new_data_start;
                     file.block_count = needed;
 
@@ -334,14 +337,15 @@ impl HeavenVfs {
                     }
                     drop(ft);
 
-                    // Step 5: Free old blocks (now safe)
+                    // Free old blocks (now safe)
                     alloc.free(old_start_block, old_block_count);
                 }
                 Err(_) => {
-                    let _ = extra; // suppress unused warning
                     return SQLITE_FULL;
                 }
             }
+            drop(alloc);
+            drop(nvme_guard);
         }
 
         let start_lba = file.start_lba + start_block;
@@ -455,17 +459,40 @@ impl HeavenVfs {
         }
         file.byte_length = size;
 
-        // TODO: release unused blocks back to the allocator
-        // For now, we keep the allocated blocks (wasteful but safe).
+        // Release unused blocks back to the allocator.
+        let bs = file.block_size as u64;
+        let needed_blocks = if size == 0 {
+            // Keep at least 1 block so the file retains a valid start LBA.
+            1
+        } else {
+            (size + bs - 1) / bs
+        };
+
+        if needed_blocks < file.block_count {
+            let mut alloc = self.allocator.lock();
+            let old_start_block = file.start_lba - alloc.data_start_lba();
+            let excess_start = old_start_block + needed_blocks;
+            let excess_count = file.block_count - needed_blocks;
+            alloc.free(excess_start, excess_count);
+            file.block_count = needed_blocks;
+
+            // Update file table entry
+            let mut ft = self.file_table.lock();
+            if let Some(entry) = ft.get_mut(file.file_table_index) {
+                entry.block_count = needed_blocks;
+                entry.byte_length = size;
+            }
+        }
 
         SQLITE_OK
     }
 
     // ---- xDelete ----
 
+    /// Lock order: allocator → file_table (NVME not needed for metadata-only ops).
     pub fn delete(&self, name: &[u8]) -> c_int {
-        let mut ft = self.file_table.lock();
         let mut alloc = self.allocator.lock();
+        let mut ft = self.file_table.lock();
 
         if let Some((idx, entry)) = ft.lookup(name) {
             let start_block = entry.start_block;
@@ -600,15 +627,34 @@ impl HeavenVfs {
     // ---- xCurrentTimeInt64 ----
 
     /// Returns current time as Julian day in milliseconds.
-    /// TODO: read from CMOS RTC; for now returns a placeholder.
+    /// Reads year/month/day/hour/minute/second from CMOS RTC (ports 0x70/0x71).
     pub fn current_time_ms(&self) -> i64 {
-        // Julian day number for Unix epoch (Jan 1, 1970) = 2440587.5
-        // In milliseconds: 2440587.5 * 86400000 = 210866760000000
-        let julian_epoch_ms: i64 = 210_866_760_000_000;
+        let (year, month, day, hour, minute, second) = read_cmos_rtc();
 
-        // TODO: read actual time from RTC or calibrated TSC
-        // For now, return epoch (better than 0, allows SQLite to function)
-        julian_epoch_ms
+        // Convert to Julian Day Number using the standard formula.
+        // JDN = (1461 * (Y + 4800 + (M - 14)/12)) / 4
+        //     + (367 * (M - 2 - 12 * ((M - 14)/12))) / 12
+        //     - (3 * ((Y + 4900 + (M - 14)/12) / 100)) / 4
+        //     + D - 32075
+        let y = year as i64;
+        let m = month as i64;
+        let d = day as i64;
+        let a = (14 - m) / 12;
+        let adj_y = y + 4800 - a;
+        let adj_m = m + 12 * a - 3;
+        let jdn = d + (153 * adj_m + 2) / 5 + 365 * adj_y + adj_y / 4 - adj_y / 100 + adj_y / 400 - 32045;
+
+        // Convert to milliseconds since Julian epoch (noon UT).
+        // Julian day starts at noon, so subtract 0.5 day and add time-of-day.
+        let day_ms: i64 = 86_400_000;
+        let time_ms = (hour as i64) * 3_600_000
+            + (minute as i64) * 60_000
+            + (second as i64) * 1_000;
+
+        // SQLite xCurrentTimeInt64 expects ms since Julian day 0, noon.
+        // jdn is the Julian day number at noon of the given date.
+        // We subtract half a day (to get to midnight) then add time_ms.
+        (jdn - 1) * day_ms + day_ms / 2 + time_ms
     }
 
     // ---- xRandomness ----
@@ -648,4 +694,71 @@ fn rdrand_u64() -> u64 {
 
 fn rdrand_u8() -> u8 {
     (rdrand_u64() & 0xFF) as u8
+}
+
+// ---- CMOS RTC reader ----
+
+use crate::arch::x86_64::{outb, inb};
+
+/// Read a CMOS RTC register (0x00=sec, 0x02=min, 0x04=hour, 0x07=day, 0x08=month, 0x09=year).
+fn cmos_read(reg: u8) -> u8 {
+    outb(0x70, reg);
+    inb(0x71)
+}
+
+/// Convert BCD-encoded byte to binary.
+fn bcd_to_bin(val: u8) -> u8 {
+    (val & 0x0F) + (val >> 4) * 10
+}
+
+/// Read date/time from CMOS RTC. Waits for a stable read (no update in progress).
+/// Returns (year, month, day, hour, minute, second) in UTC.
+fn read_cmos_rtc() -> (u32, u32, u32, u32, u32, u32) {
+    // Wait until RTC is not updating (bit 7 of register 0x0A).
+    while cmos_read(0x0A) & 0x80 != 0 {
+        core::hint::spin_loop();
+    }
+
+    let sec = cmos_read(0x00);
+    let min = cmos_read(0x02);
+    let hour = cmos_read(0x04);
+    let day = cmos_read(0x07);
+    let month = cmos_read(0x08);
+    let year = cmos_read(0x09);
+    let century = cmos_read(0x32); // ACPI century register (may be 0)
+
+    // Check status register B for BCD vs binary mode.
+    let status_b = cmos_read(0x0B);
+    let is_bcd = status_b & 0x04 == 0;
+
+    let (sec, min, hour, day, month, year, century) = if is_bcd {
+        (
+            bcd_to_bin(sec),
+            bcd_to_bin(min),
+            bcd_to_bin(hour & 0x7F), // mask AM/PM bit
+            bcd_to_bin(day),
+            bcd_to_bin(month),
+            bcd_to_bin(year),
+            bcd_to_bin(century),
+        )
+    } else {
+        (sec, min, hour & 0x7F, day, month, year, century)
+    };
+
+    // Handle 12-hour mode
+    let hour = if status_b & 0x02 == 0 && hour & 0x80 != 0 {
+        // 12-hour mode, PM flag set
+        ((hour & 0x7F) % 12) + 12
+    } else {
+        hour
+    };
+
+    // Full 4-digit year
+    let full_year = if century > 0 {
+        century as u32 * 100 + year as u32
+    } else {
+        2000 + year as u32
+    };
+
+    (full_year, month as u32, day as u32, hour as u32, min as u32, sec as u32)
 }

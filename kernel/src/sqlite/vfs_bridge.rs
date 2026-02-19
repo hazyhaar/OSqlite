@@ -1,4 +1,4 @@
-#![allow(non_snake_case, static_mut_refs)]
+#![allow(non_snake_case)]
 /// VFS bridge — registers a SQLite VFS that delegates to HeavenVfs.
 ///
 /// SQLite expects a C struct (sqlite3_vfs) with function pointers for
@@ -7,6 +7,7 @@
 ///
 /// The VFS global is stored in a static Mutex and set up during boot
 /// (after NVMe + block allocator + file table are ready).
+use core::cell::UnsafeCell;
 use core::ffi::{c_char, c_int, c_void};
 use core::ptr;
 use alloc::string::String;
@@ -114,9 +115,13 @@ static IO_METHODS: Sqlite3IoMethods = Sqlite3IoMethods {
     xDeviceCharacteristics: Some(heaven_device_characteristics),
 };
 
-/// The VFS instance. Must be in static mutable memory because SQLite
-/// modifies the pNext field.
-static mut HEAVEN_VFS: Sqlite3Vfs = Sqlite3Vfs {
+/// Wrapper to allow a static Sqlite3Vfs in an UnsafeCell (SQLite modifies pNext).
+struct SyncVfs(UnsafeCell<Sqlite3Vfs>);
+unsafe impl Sync for SyncVfs {}
+
+/// The VFS instance. Wrapped in UnsafeCell because SQLite's C code
+/// modifies the pNext field when registering/unregistering VFS instances.
+static HEAVEN_VFS: SyncVfs = SyncVfs(UnsafeCell::new(Sqlite3Vfs {
     iVersion: 3,
     szOsFile: core::mem::size_of::<HeavenSqliteFile>() as c_int,
     mxPathname: 256,
@@ -139,7 +144,7 @@ static mut HEAVEN_VFS: Sqlite3Vfs = Sqlite3Vfs {
     xSetSystemCall: None,
     xGetSystemCall: None,
     xNextSystemCall: None,
-};
+}));
 
 // ---- Registration ----
 
@@ -150,8 +155,9 @@ extern "C" {
 /// Register the "heaven" VFS with SQLite.
 pub fn register_vfs() -> Result<(), String> {
     unsafe {
-        HEAVEN_VFS.zName = VFS_NAME.as_ptr() as *const c_char;
-        let rc = sqlite3_vfs_register(&mut HEAVEN_VFS as *mut Sqlite3Vfs, 1);
+        let vfs = HEAVEN_VFS.0.get();
+        (*vfs).zName = VFS_NAME.as_ptr() as *const c_char;
+        let rc = sqlite3_vfs_register(vfs, 1);
         if rc != SQLITE_OK {
             return Err(alloc::format!("sqlite3_vfs_register failed: {}", rc));
         }
@@ -161,28 +167,24 @@ pub fn register_vfs() -> Result<(), String> {
 
 // ---- Helper: get HeavenVfs from the global VFS singleton ----
 
-/// Access the global VFS. Returns None if not initialized.
+/// Access the global VFS. Panics if not initialized.
 fn with_vfs<F, R>(f: F) -> R
 where
     F: FnOnce(&crate::vfs::HeavenVfs) -> R,
 {
-    // The HeavenVfs is stored in a global. We access it through the vfs module.
-    // For now we use a static that's set up before SQLite init.
-    unsafe {
-        let vfs = VFS_INSTANCE.as_ref().expect("HeavenVfs not initialized");
-        f(vfs)
-    }
+    let vfs = VFS_INSTANCE.get().expect("HeavenVfs not initialized");
+    f(vfs)
 }
 
-/// Global HeavenVfs pointer — set before register_vfs() is called.
-static mut VFS_INSTANCE: Option<&'static HeavenVfs> = None;
+/// Global HeavenVfs pointer — initialized once via spin::Once.
+static VFS_INSTANCE: spin::Once<&'static HeavenVfs> = spin::Once::new();
 
 /// Set the global VFS instance. Called from init code before sqlite::init().
 ///
 /// # Safety
 /// Must be called exactly once, with a reference that lives for 'static.
 pub unsafe fn set_vfs_instance(vfs: &'static HeavenVfs) {
-    unsafe { VFS_INSTANCE = Some(vfs); }
+    VFS_INSTANCE.call_once(|| vfs);
 }
 
 // ---- Helper: C string → byte slice ----

@@ -99,35 +99,40 @@ struct IdtPointer {
     base: u64,
 }
 
-static mut IDT: Idt = Idt::new();
+/// Global IDT instance — initialized once during boot via spin::Once.
+static IDT: spin::Once<Idt> = spin::Once::new();
 
 /// Initialize the IDT with exception handlers and load it.
 ///
 /// # Safety
 /// Must be called after GDT init. Called once during boot.
 pub unsafe fn init() {
-    let idt = &raw mut IDT;
+    IDT.call_once(|| {
+        let mut idt = Idt::new();
 
-    // CPU exceptions
-    (*idt).entries[0]  = IdtEntry::interrupt_gate(isr_de as *const () as u64);
-    (*idt).entries[1]  = IdtEntry::interrupt_gate(isr_db as *const () as u64);
-    (*idt).entries[2]  = IdtEntry::interrupt_gate(isr_nmi as *const () as u64);
-    (*idt).entries[3]  = IdtEntry::trap_gate(isr_bp as *const () as u64);
-    (*idt).entries[4]  = IdtEntry::interrupt_gate(isr_of as *const () as u64);
-    (*idt).entries[5]  = IdtEntry::interrupt_gate(isr_br as *const () as u64);
-    (*idt).entries[6]  = IdtEntry::interrupt_gate(isr_ud as *const () as u64);
-    (*idt).entries[7]  = IdtEntry::interrupt_gate(isr_nm as *const () as u64);
-    (*idt).entries[8]  = IdtEntry::interrupt_gate(isr_df as *const () as u64);
-    (*idt).entries[13] = IdtEntry::interrupt_gate(isr_gp as *const () as u64);
-    (*idt).entries[14] = IdtEntry::interrupt_gate(isr_pf as *const () as u64);
+        // CPU exceptions
+        idt.entries[0]  = IdtEntry::interrupt_gate(isr_de as *const () as u64);
+        idt.entries[1]  = IdtEntry::interrupt_gate(isr_db as *const () as u64);
+        idt.entries[2]  = IdtEntry::interrupt_gate(isr_nmi as *const () as u64);
+        idt.entries[3]  = IdtEntry::trap_gate(isr_bp as *const () as u64);
+        idt.entries[4]  = IdtEntry::interrupt_gate(isr_of as *const () as u64);
+        idt.entries[5]  = IdtEntry::interrupt_gate(isr_br as *const () as u64);
+        idt.entries[6]  = IdtEntry::interrupt_gate(isr_ud as *const () as u64);
+        idt.entries[7]  = IdtEntry::interrupt_gate(isr_nm as *const () as u64);
+        idt.entries[8]  = IdtEntry::interrupt_gate(isr_df as *const () as u64);
+        idt.entries[13] = IdtEntry::interrupt_gate(isr_gp as *const () as u64);
+        idt.entries[14] = IdtEntry::interrupt_gate(isr_pf as *const () as u64);
 
-    // PIC IRQs (remapped to 32-47) — spurious handler for all
-    for i in 32..48 {
-        (*idt).entries[i] = IdtEntry::interrupt_gate(isr_irq_stub as *const () as u64);
-    }
+        // PIC IRQs (remapped to 32-47) — spurious handler for all
+        for i in 32..48 {
+            idt.entries[i] = IdtEntry::interrupt_gate(isr_irq_stub as *const () as u64);
+        }
 
-    // Safety: IDT is initialized above and lives for 'static lifetime
-    (*idt).load();
+        idt
+    });
+
+    // Safety: IDT was initialized above and lives for 'static lifetime in spin::Once.
+    IDT.get().unwrap().load();
 }
 
 // ---- Exception frame passed by the CPU on interrupt ----

@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-spin = { version = "0.9", default-features = false, features = ["mutex", "spin_mutex", "rwlock"] }
+spin = { version = "0.9", default-features = false, features = ["mutex", "spin_mutex", "rwlock", "once"] }
 bitflags = "2"
 static_assertions = "1"
 limine = "0.5"

@@ -3,9 +3,7 @@
 /// NVMe controllers are PCI class 01h (Mass Storage), subclass 08h (NVM),
 /// programming interface 02h (NVMe).
 use crate::mem::PhysAddr;
-
-const PCI_CONFIG_ADDR: u16 = 0xCF8;
-const PCI_CONFIG_DATA: u16 = 0xCFC;
+use crate::drivers::pci::{pci_read32, pci_write32};
 
 /// PCI device identification.
 #[derive(Debug, Clone)]
@@ -19,57 +17,6 @@ pub struct PciDevice {
     pub subclass: u8,
     pub prog_if: u8,
     pub bar0: u64,
-}
-
-/// Read a 32-bit value from PCI configuration space.
-fn pci_read32(bus: u8, device: u8, func: u8, offset: u8) -> u32 {
-    let addr: u32 = 0x8000_0000
-        | ((bus as u32) << 16)
-        | ((device as u32) << 11)
-        | ((func as u32) << 8)
-        | ((offset as u32) & 0xFC);
-
-    unsafe {
-        core::arch::asm!(
-            "out dx, eax",
-            in("dx") PCI_CONFIG_ADDR,
-            in("eax") addr,
-            options(nostack, preserves_flags),
-        );
-
-        let val: u32;
-        core::arch::asm!(
-            "in eax, dx",
-            in("dx") PCI_CONFIG_DATA,
-            out("eax") val,
-            options(nostack, preserves_flags),
-        );
-        val
-    }
-}
-
-/// Write a 32-bit value to PCI configuration space.
-fn pci_write32(bus: u8, device: u8, func: u8, offset: u8, val: u32) {
-    let addr: u32 = 0x8000_0000
-        | ((bus as u32) << 16)
-        | ((device as u32) << 11)
-        | ((func as u32) << 8)
-        | ((offset as u32) & 0xFC);
-
-    unsafe {
-        core::arch::asm!(
-            "out dx, eax",
-            in("dx") PCI_CONFIG_ADDR,
-            in("eax") addr,
-            options(nostack, preserves_flags),
-        );
-        core::arch::asm!(
-            "out dx, eax",
-            in("dx") PCI_CONFIG_DATA,
-            in("eax") val,
-            options(nostack, preserves_flags),
-        );
-    }
 }
 
 /// Read BAR0 (Base Address Register 0) — may be 32-bit or 64-bit.
