@@ -7,6 +7,7 @@ edition.workspace = true
 spin = { version = "0.9", default-features = false, features = ["mutex", "spin_mutex", "rwlock"] }
 bitflags = "2"
 static_assertions = "1"
+smoltcp = { version = "0.11", default-features = false, features = ["medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-tcp", "alloc"] }
 
 [features]
 default = []
