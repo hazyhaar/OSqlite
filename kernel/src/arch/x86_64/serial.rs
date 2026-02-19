@@ -1,7 +1,7 @@
-/// Serial port driver (COM1, 0x3F8) for debug output.
+/// Serial port driver (COM1, 0x3F8) — bidirectional.
 ///
-/// This is the primary debug channel for bare-metal development.
-/// QEMU can redirect serial output to the host terminal.
+/// Output: debug logging via serial_println!
+/// Input: interactive shell via read_byte / try_read_byte
 use core::fmt;
 use spin::Mutex;
 
@@ -29,6 +29,8 @@ impl Serial {
         super::outb(self.port + 4, 0x0B); // IRQs enabled, RTS/DSR set
     }
 
+    // ---- Output ----
+
     /// Check if the transmit buffer is empty.
     fn is_transmit_empty(&self) -> bool {
         super::inb(self.port + 5) & 0x20 != 0
@@ -49,6 +51,30 @@ impl Serial {
                 self.write_byte(b'\r');
             }
             self.write_byte(byte);
+        }
+    }
+
+    // ---- Input ----
+
+    /// Check if a byte is available to read (LSR bit 0 = Data Ready).
+    pub fn has_data(&self) -> bool {
+        super::inb(self.port + 5) & 0x01 != 0
+    }
+
+    /// Read a byte, blocking until one is available.
+    pub fn read_byte(&self) -> u8 {
+        while !self.has_data() {
+            core::hint::spin_loop();
+        }
+        super::inb(self.port)
+    }
+
+    /// Try to read a byte without blocking. Returns None if no data available.
+    pub fn try_read_byte(&self) -> Option<u8> {
+        if self.has_data() {
+            Some(super::inb(self.port))
+        } else {
+            None
         }
     }
 }

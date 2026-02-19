@@ -81,12 +81,10 @@ pub extern "C" fn _start() -> ! {
     let _server = styx::StyxServer::new(root);
     serial_println!("[styx] Namespace ready");
 
-    serial_println!("HeavenOS boot complete. Entering main loop.");
+    serial_println!("HeavenOS boot complete.");
 
-    // Main loop: poll NVMe completions, service Styx requests
-    loop {
-        x86_64::hlt();
-    }
+    // Drop into interactive shell over serial console
+    heavenos_kernel::shell::run();
 }
 
 /// Initialize the storage subsystem — format or load from disk.
