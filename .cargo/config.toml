@@ -2,8 +2,11 @@
 target = "x86_64-unknown-none"
 
 [target.x86_64-unknown-none]
-runner = "qemu-system-x86_64 -drive format=raw,file="
-rustflags = ["-C", "link-arg=-Tkernel/linker.ld", "-C", "code-model=kernel"]
+rustflags = [
+    "-C", "link-arg=-Tkernel/linker.ld",
+    "-C", "code-model=kernel",
+    "-C", "relocation-model=static",
+]
 
 [unstable]
 build-std = ["core", "alloc", "compiler_builtins"]

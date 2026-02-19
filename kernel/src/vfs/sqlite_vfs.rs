@@ -278,26 +278,31 @@ impl HeavenVfs {
             let extra = needed - file.block_count;
             let mut alloc = self.allocator.lock();
 
-            // Try to allocate a new contiguous region and relocate
+            // Try to allocate a new contiguous region and relocate.
+            // Crash-safe ordering:
+            //   1. Alloc new region
+            //   2. Copy old data → new region
+            //   3. NVMe Flush (new data durable)
+            //   4. Update file table to point to new region
+            //   5. Free old blocks (safe: file table already points to new region)
             match alloc.alloc(needed) {
                 Ok(new_start_block) => {
-                    // Got a larger region — copy old data, free old blocks
                     let old_data_start = file.start_lba;
+                    let old_start_block = file.start_lba - alloc.data_start_lba();
+                    let old_block_count = file.block_count;
                     let new_data_start = alloc.data_start_lba() + new_start_block;
 
-                    // We need NVMe to copy blocks
+                    // Step 2: Copy existing blocks to new region
                     let mut nvme_guard = NVME.lock();
                     let nvme = match nvme_guard.as_mut() {
                         Some(n) => n,
                         None => return SQLITE_IOERR,
                     };
 
-                    // Copy existing blocks one at a time
                     let copy_bs = file.block_size as usize;
                     if let Ok(mut tmp) = DmaBuf::alloc(copy_bs) {
-                        for blk in 0..file.block_count {
+                        for blk in 0..old_block_count {
                             if nvme.read_blocks(old_data_start + blk, 1, &mut tmp).is_err() {
-                                // Rollback: free new allocation
                                 alloc.free(new_start_block, needed);
                                 return SQLITE_IOERR_READ;
                             }
@@ -310,22 +315,27 @@ impl HeavenVfs {
                         alloc.free(new_start_block, needed);
                         return SQLITE_IOERR_NOMEM;
                     }
+
+                    // Step 3: Flush to ensure new copies are durable
+                    if nvme.flush().is_err() {
+                        alloc.free(new_start_block, needed);
+                        return SQLITE_IOERR_FSYNC;
+                    }
                     drop(nvme_guard);
 
-                    // Free old blocks (using data-block-relative index)
-                    let old_start_block = file.start_lba - alloc.data_start_lba();
-                    alloc.free(old_start_block, file.block_count);
-
-                    // Update file metadata
+                    // Step 4: Update metadata BEFORE freeing old blocks
                     file.start_lba = new_data_start;
                     file.block_count = needed;
 
-                    // Update file table
                     let mut ft = self.file_table.lock();
                     if let Some(entry) = ft.get_mut(file.file_table_index) {
                         entry.start_block = new_start_block;
                         entry.block_count = needed;
                     }
+                    drop(ft);
+
+                    // Step 5: Free old blocks (now safe)
+                    alloc.free(old_start_block, old_block_count);
                 }
                 Err(_) => {
                     let _ = extra; // suppress unused warning

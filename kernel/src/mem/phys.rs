@@ -4,7 +4,23 @@
 /// runs of pages with alignment constraints (required for DMA buffers
 /// and PRP lists).
 use core::fmt;
+use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
+
+/// Higher-Half Direct Map offset, set once at boot from Limine's HHDM response.
+/// All physical memory is linearly mapped at virtual address (phys + HHDM_OFFSET).
+static HHDM_OFFSET: AtomicU64 = AtomicU64::new(0);
+
+/// Set the HHDM offset. Must be called once during early boot before any
+/// PhysAddr::as_ptr() calls.
+pub fn set_hhdm_offset(offset: u64) {
+    HHDM_OFFSET.store(offset, Ordering::Relaxed);
+}
+
+/// Get the current HHDM offset.
+pub fn hhdm_offset() -> u64 {
+    HHDM_OFFSET.load(Ordering::Relaxed)
+}
 
 /// A physical address. Transparent wrapper for clarity.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -20,9 +36,11 @@ impl PhysAddr {
         self.0
     }
 
-    /// In identity-mapped regions, phys == virt.
+    /// Convert to a virtual pointer via the HHDM (Higher-Half Direct Map).
+    /// virt = phys + hhdm_offset.
     pub fn as_ptr<T>(self) -> *mut T {
-        self.0 as *mut T
+        let offset = HHDM_OFFSET.load(Ordering::Relaxed);
+        (self.0 + offset) as *mut T
     }
 }
 

@@ -87,17 +87,23 @@ dependencies = [
 ]
 
 [[package]]
-name = "heavenos-boot"
-version = "0.1.0"
-
-[[package]]
 name = "heavenos-kernel"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.11.0",
+ "limine",
  "smoltcp",
  "spin",
  "static_assertions",
+]
+
+[[package]]
+name = "limine"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af6d2ee42712e7bd2c787365cd1dab06ef59a61becbf87bec7b32b970bd2594b"
+dependencies = [
+ "bitflags 2.11.0",
 ]
 
 [[package]]

@@ -11,7 +11,7 @@ use super::phys::{PhysAddr, AllocError, PAGE_SIZE, PHYS_ALLOCATOR};
 
 /// A DMA-safe buffer backed by physically contiguous pages.
 ///
-/// In the identity-mapped kernel region, virt == phys.
+/// Virtual pointers use the HHDM: virt = phys + hhdm_offset.
 pub struct DmaBuf {
     phys: PhysAddr,
     len: usize,
@@ -68,7 +68,7 @@ impl DmaBuf {
         self.phys
     }
 
-    /// Virtual address (== physical in identity-mapped region).
+    /// Virtual address (phys + hhdm_offset).
     #[inline]
     pub fn as_ptr(&self) -> *const u8 {
         self.phys.as_ptr()

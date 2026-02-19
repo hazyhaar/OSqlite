@@ -11,6 +11,18 @@ use crate::arch::x86_64::serial::SERIAL;
 
 const MAX_LINE: usize = 256;
 
+/// Try to read a byte from serial within a spin-loop timeout.
+/// `timeout_iters` is the approximate number of spin iterations to wait.
+fn spin_try_read(timeout_iters: u32) -> Option<u8> {
+    for _ in 0..timeout_iters {
+        if let Some(b) = SERIAL.lock().try_read_byte() {
+            return Some(b);
+        }
+        core::hint::spin_loop();
+    }
+    None
+}
+
 pub struct LineEditor {
     buf: [u8; MAX_LINE],
     len: usize,
@@ -83,17 +95,20 @@ impl LineEditor {
                     }
                 }
 
-                // Escape sequences (arrow keys etc.) — consume and ignore
+                // Escape sequences (arrow keys etc.) — consume and ignore.
+                // Use try_read_byte with a spin timeout to avoid blocking
+                // forever on incomplete sequences (e.g. lone ESC).
                 0x1B => {
-                    // Read the rest of the escape sequence without holding the lock
-                    // across blocking reads (which would deadlock).
-                    let maybe_bracket = SERIAL.lock().try_read_byte();
-                    if let Some(b'[') = maybe_bracket {
-                        // CSI sequence — read until a letter or ~ (max 8 bytes to prevent hang)
+                    let maybe_bracket = spin_try_read(500_000);
+                    if maybe_bracket == Some(b'[') {
+                        // CSI sequence — read until a letter or ~ (max 8 params)
                         for _ in 0..8 {
-                            let c = SERIAL.lock().read_byte();
-                            if c.is_ascii_alphabetic() || c == b'~' {
-                                break;
+                            if let Some(c) = spin_try_read(500_000) {
+                                if c.is_ascii_alphabetic() || c == b'~' {
+                                    break;
+                                }
+                            } else {
+                                break; // timeout — incomplete sequence
                             }
                         }
                     }

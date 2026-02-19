@@ -1,42 +1,53 @@
-/* HeavenOS kernel linker script — x86_64 higher-half kernel */
+/* HeavenOS kernel linker script — x86_64 higher-half for Limine boot protocol */
 
-ENTRY(_start)
+OUTPUT_FORMAT(elf64-x86-64)
+ENTRY(kmain)
 
-KERNEL_VIRT_BASE = 0xFFFFFFFF80000000; /* -2 GiB, classic higher-half */
+PHDRS
+{
+    text    PT_LOAD;
+    rodata  PT_LOAD;
+    data    PT_LOAD;
+}
 
 SECTIONS
 {
-    . = KERNEL_VIRT_BASE;
+    /* Limine spec mandates the kernel be placed in the topmost 2 GiB. */
+    . = 0xFFFFFFFF80000000;
 
-    .text ALIGN(4K) :
-    {
-        KEEP(*(.text.boot))    /* Boot entry point first */
+    .text : {
         *(.text .text.*)
-    }
+    } :text
 
-    .rodata ALIGN(4K) :
-    {
+    . = ALIGN(CONSTANT(MAXPAGESIZE));
+
+    .rodata : {
         *(.rodata .rodata.*)
-    }
+    } :rodata
 
-    .data ALIGN(4K) :
-    {
+    . = ALIGN(CONSTANT(MAXPAGESIZE));
+
+    .data : {
         *(.data .data.*)
-    }
 
-    .bss ALIGN(4K) :
-    {
+        /* Limine request sections — must be inside a loaded segment. */
+        KEEP(*(.requests_start_marker))
+        KEEP(*(.requests))
+        KEEP(*(.requests_end_marker))
+    } :data
+
+    /* .bss must be last in :data to avoid bloating the binary with zeros. */
+    .bss : {
         __bss_start = .;
         *(.bss .bss.*)
         *(COMMON)
         __bss_end = .;
-    }
+    } :data
 
     __kernel_end = .;
 
-    /DISCARD/ :
-    {
-        *(.eh_frame)
+    /DISCARD/ : {
+        *(.eh_frame*)
         *(.note .note.*)
         *(.comment)
     }
