@@ -94,6 +94,10 @@ const SQLITE_OPEN_CREATE: c_int = 0x00000004;
 static VFS_NAME: &[u8] = b"heaven\0";
 
 /// The I/O methods table — shared by all open files.
+///
+/// iVersion=1: basic file I/O only. WAL (v2: xShmMap/Lock/Barrier/Unmap)
+/// and mmap (v3: xFetch/xUnfetch) are not needed because we compile SQLite
+/// with SQLITE_OMIT_WAL and don't support memory-mapped I/O.
 static IO_METHODS: Sqlite3IoMethods = Sqlite3IoMethods {
     iVersion: 1,
     xClose: Some(heaven_close),
@@ -183,7 +187,13 @@ pub unsafe fn set_vfs_instance(vfs: &'static HeavenVfs) {
 
 // ---- Helper: C string → byte slice ----
 
-unsafe fn cstr_to_bytes(s: *const c_char) -> &'static [u8] {
+/// Convert a C string to a byte slice.
+///
+/// # Safety
+/// `s` must point to a valid null-terminated string that remains
+/// valid for the lifetime of the returned slice. If `s` is null,
+/// returns an empty slice.
+unsafe fn cstr_to_bytes<'a>(s: *const c_char) -> &'a [u8] {
     if s.is_null() {
         return b"";
     }
@@ -269,7 +279,12 @@ unsafe extern "C" fn heaven_truncate(pFile: *mut Sqlite3File, size: i64) -> c_in
     let file = pFile as *mut HeavenSqliteFile;
     let mut hfile = unsafe { heaven_file_to_vfs_file(&*file) };
     let rc = with_vfs(|vfs| vfs.truncate(&mut hfile, size as u64));
-    unsafe { (*file).byte_length = hfile.byte_length; }
+    // Sync all metadata back — truncate may release blocks
+    unsafe {
+        (*file).byte_length = hfile.byte_length;
+        (*file).block_count = hfile.block_count;
+        (*file).start_lba = hfile.start_lba;
+    }
     rc
 }
 
@@ -315,8 +330,10 @@ unsafe extern "C" fn heaven_file_control(
     SQLITE_NOTFOUND // We don't handle any FCNTL
 }
 
-unsafe extern "C" fn heaven_sector_size(_pFile: *mut Sqlite3File) -> c_int {
-    4096 // NVMe block size
+unsafe extern "C" fn heaven_sector_size(pFile: *mut Sqlite3File) -> c_int {
+    let file = pFile as *const HeavenSqliteFile;
+    let bs = unsafe { (*file).block_size };
+    if bs > 0 { bs as c_int } else { 4096 }
 }
 
 unsafe extern "C" fn heaven_device_characteristics(_pFile: *mut Sqlite3File) -> c_int {

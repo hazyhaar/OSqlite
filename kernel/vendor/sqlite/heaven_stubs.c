@@ -344,21 +344,17 @@ int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap) {
             is_long = 1; /* size_t = unsigned long on x86_64 */
         }
 
-        /* Conversion */
-        size_t start = pos;
+        /* Format into a small temp buffer, then apply width padding. */
+        char tmp[64];
+        int tmplen = 0;
+
         switch (*fmt) {
         case 'd': case 'i': {
             long long val;
             if (is_longlong) val = va_arg(ap, long long);
             else if (is_long) val = va_arg(ap, long);
             else val = va_arg(ap, int);
-            int len = fmt_int(buf, n, pos, val);
-            /* Zero-padding */
-            if (zero_pad && width > len) {
-                /* Simple: we already wrote digits; this is imperfect for negative + zero-pad
-                 * but sufficient for SQLite's needs */
-            }
-            pos += len;
+            tmplen = fmt_int(tmp, sizeof(tmp), 0, val);
             break;
         }
         case 'u': {
@@ -366,7 +362,7 @@ int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap) {
             if (is_longlong) val = va_arg(ap, unsigned long long);
             else if (is_long) val = va_arg(ap, unsigned long);
             else val = va_arg(ap, unsigned int);
-            pos += fmt_uint(buf, n, pos, val, 10, 0);
+            tmplen = fmt_uint(tmp, sizeof(tmp), 0, val, 10, 0);
             break;
         }
         case 'x': case 'X': {
@@ -374,7 +370,7 @@ int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap) {
             if (is_longlong) val = va_arg(ap, unsigned long long);
             else if (is_long) val = va_arg(ap, unsigned long);
             else val = va_arg(ap, unsigned int);
-            pos += fmt_uint(buf, n, pos, val, 16, *fmt == 'X');
+            tmplen = fmt_uint(tmp, sizeof(tmp), 0, val, 16, *fmt == 'X');
             break;
         }
         case 'o': {
@@ -382,20 +378,19 @@ int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap) {
             if (is_longlong) val = va_arg(ap, unsigned long long);
             else if (is_long) val = va_arg(ap, unsigned long);
             else val = va_arg(ap, unsigned int);
-            pos += fmt_uint(buf, n, pos, val, 8, 0);
+            tmplen = fmt_uint(tmp, sizeof(tmp), 0, val, 8, 0);
             break;
         }
         case 'f': {
             double val = va_arg(ap, double);
             int prec = (precision >= 0) ? precision : 6;
-            pos += fmt_double(buf, n, pos, val, prec);
+            tmplen = fmt_double(tmp, sizeof(tmp), 0, val, prec);
             break;
         }
         case 'e': case 'E': case 'g': case 'G': {
-            /* Simplified: just use %f formatting */
             double val = va_arg(ap, double);
             int prec = (precision >= 0) ? precision : 6;
-            pos += fmt_double(buf, n, pos, val, prec);
+            tmplen = fmt_double(tmp, sizeof(tmp), 0, val, prec);
             break;
         }
         case 's': {
@@ -403,44 +398,74 @@ int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap) {
             if (!s) s = "(null)";
             int slen = strlen(s);
             if (precision >= 0 && precision < slen) slen = precision;
+            /* String: pad with spaces, then copy */
+            if (!left_align && width > slen) {
+                for (int i = 0; i < width - slen; i++) {
+                    if (pos < n - 1) buf[pos] = ' ';
+                    pos++;
+                }
+            }
             for (int i = 0; i < slen; i++) {
                 if (pos < n - 1) buf[pos] = s[i];
                 pos++;
             }
+            if (left_align && width > slen) {
+                for (int i = 0; i < width - slen; i++) {
+                    if (pos < n - 1) buf[pos] = ' ';
+                    pos++;
+                }
+            }
+            tmplen = -1; /* already handled */
             break;
         }
         case 'c': {
             int c = va_arg(ap, int);
-            if (pos < n - 1) buf[pos] = (char)c;
-            pos++;
+            tmp[0] = (char)c;
+            tmplen = 1;
             break;
         }
         case 'p': {
             void *ptr = va_arg(ap, void *);
-            if (pos < n - 1) buf[pos] = '0'; pos++;
-            if (pos < n - 1) buf[pos] = 'x'; pos++;
-            pos += fmt_uint(buf, n, pos, (unsigned long long)(uintptr_t)ptr, 16, 0);
+            tmp[0] = '0'; tmp[1] = 'x';
+            tmplen = 2 + fmt_uint(tmp + 2, sizeof(tmp) - 2, 0,
+                                  (unsigned long long)(uintptr_t)ptr, 16, 0);
             break;
         }
         case '%':
-            if (pos < n - 1) buf[pos] = '%';
-            pos++;
+            tmp[0] = '%';
+            tmplen = 1;
             break;
         case 'n':
-            /* Intentionally not supported (security) */
+            tmplen = -1;
             break;
         default:
-            /* Unknown format specifier — just emit it */
-            if (pos < n - 1) buf[pos] = '%';
-            pos++;
-            if (pos < n - 1) buf[pos] = *fmt;
-            pos++;
+            tmp[0] = '%'; tmp[1] = *fmt;
+            tmplen = 2;
             break;
         }
 
-        /* Width padding (post-print, right-pad with spaces if needed) */
-        (void)start;
-        (void)width;
+        /* Apply width padding and copy to output buffer */
+        if (tmplen >= 0) {
+            char pad_char = zero_pad ? '0' : ' ';
+            int pad_count = (width > tmplen) ? (width - tmplen) : 0;
+
+            if (!left_align) {
+                for (int i = 0; i < pad_count; i++) {
+                    if (pos < n - 1) buf[pos] = pad_char;
+                    pos++;
+                }
+            }
+            for (int i = 0; i < tmplen; i++) {
+                if (pos < n - 1) buf[pos] = tmp[i];
+                pos++;
+            }
+            if (left_align) {
+                for (int i = 0; i < pad_count; i++) {
+                    if (pos < n - 1) buf[pos] = ' ';
+                    pos++;
+                }
+            }
+        }
 
         if (*fmt) fmt++;
     }
@@ -458,9 +483,13 @@ int snprintf(char *buf, size_t n, const char *fmt, ...) {
 }
 
 int sprintf(char *buf, const char *fmt, ...) {
+    /* sprintf is inherently unsafe (no size limit). We use a reasonable
+     * upper bound — SQLite internally only uses snprintf, but strtod or
+     * other stubs may call sprintf with small buffers. 1024 is a safe
+     * default that covers number formatting. */
     va_list ap;
     va_start(ap, fmt);
-    int ret = vsnprintf(buf, 65536, fmt, ap);
+    int ret = vsnprintf(buf, 1024, fmt, ap);
     va_end(ap);
     return ret;
 }
