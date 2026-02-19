@@ -1,0 +1,13 @@
+[package]
+name = "heavenos-kernel"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+spin = { version = "0.9", default-features = false, features = ["mutex", "spin_mutex", "rwlock"] }
+bitflags = "2"
+static_assertions = "1"
+
+[features]
+default = []
+test-mock-nvme = []    # Use RAM-backed NVMe for testing
