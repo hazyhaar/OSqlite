@@ -1,6 +1,6 @@
-//! Raw FFI bindings to the Lua 5.4.8 C API.
+//! Raw FFI bindings to the Lua 5.5.0 C API.
 
-use core::ffi::{c_char, c_int, c_void};
+use core::ffi::{c_char, c_int, c_uint, c_void};
 
 pub type LuaState = c_void;
 pub type LuaCFunction = unsafe extern "C" fn(*mut LuaState) -> c_int;
@@ -8,9 +8,9 @@ pub type LuaAllocF = unsafe extern "C" fn(*mut c_void, *mut c_void, usize, usize
 
 extern "C" {
     // === Lifecycle ===
-    pub fn lua_newstate(f: LuaAllocF, ud: *mut c_void) -> *mut LuaState;
+    pub fn lua_newstate(f: LuaAllocF, ud: *mut c_void, seed: c_uint) -> *mut LuaState;
     pub fn lua_close(L: *mut LuaState);
-    pub fn luaL_openlibs(L: *mut LuaState);
+    pub fn luaL_openselectedlibs(L: *mut LuaState, load: c_int, preload: c_int);
 
     // === Stack ===
     pub fn lua_gettop(L: *mut LuaState) -> c_int;
@@ -91,9 +91,18 @@ pub const LUA_TSTRING: c_int = 4;
 pub const LUA_TTABLE: c_int = 5;
 
 pub const LUA_MULTRET: c_int = -1;
-pub const LUA_REGISTRYINDEX: c_int = -1001000;
 
-pub const LUA_GCINC: c_int = 9;
+// Lua 5.5: LUA_REGISTRYINDEX = -(INT_MAX/2 + 1000)
+pub const LUA_REGISTRYINDEX: c_int = -(i32::MAX / 2 + 1000);
+
+// GC options (Lua 5.5 renumbered these)
+pub const LUA_GCINC: c_int = 8;
+pub const LUA_GCPARAM: c_int = 9;
+
+// GC parameter IDs (for LUA_GCPARAM)
+pub const LUA_GCPPAUSE: c_int = 3;
+pub const LUA_GCPSTEPMUL: c_int = 4;
+pub const LUA_GCPSTEPSIZE: c_int = 5;
 
 // Debug hook masks
 pub const LUA_MASKCOUNT: c_int = 1 << 3;
@@ -125,6 +134,12 @@ pub unsafe fn lua_isstring(L: *mut LuaState, idx: c_int) -> bool {
 #[inline]
 pub unsafe fn lua_isnil(L: *mut LuaState, idx: c_int) -> bool {
     lua_type(L, idx) == LUA_TNIL
+}
+
+/// Wrapper matching the old `luaL_openlibs(L)` call.
+#[inline]
+pub unsafe fn luaL_openlibs(L: *mut LuaState) {
+    luaL_openselectedlibs(L, !0, 0);
 }
 
 /// Get a string from the Lua stack as a byte slice.

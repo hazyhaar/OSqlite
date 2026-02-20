@@ -3,7 +3,7 @@
 /// Compiles:
 /// 1. SQLite 3.51.2 amalgamation + bare-metal stubs
 /// 2. setjmp/longjmp assembly
-/// 3. Lua 5.4.8 runtime + bare-metal stubs
+/// 3. Lua 5.5.0 runtime + bare-metal stubs
 fn main() {
     // Skip C compilation when building for the host target (unit tests).
     // The storage unit tests only exercise pure Rust bitmap/file-table logic
@@ -49,7 +49,7 @@ fn main() {
     }
     asm.compile("heaven_setjmp");
 
-    // ---- Lua 5.4.8 ----
+    // ---- Lua 5.5.0 ----
     let lua_sources = [
         "lapi.c",
         "lauxlib.c",
@@ -102,7 +102,7 @@ fn main() {
     for src in &lua_sources {
         cc_lua.file(format!("vendor/lua/{}", src));
     }
-    cc_lua.warnings(false).flag("-w").compile("lua54");
+    cc_lua.warnings(false).flag("-w").compile("lua55");
 
     // Tell cargo to re-run if vendor files change
     println!("cargo:rerun-if-changed=vendor/sqlite/sqlite3.c");

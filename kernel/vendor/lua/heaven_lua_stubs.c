@@ -1,5 +1,5 @@
 /*
- * heaven_lua_stubs.c — libc stubs for bare-metal Lua 5.4.8.
+ * heaven_lua_stubs.c — libc stubs for bare-metal Lua 5.5.0.
  *
  * Lua needs more libc than SQLite. We provide:
  * - stb_sprintf for snprintf/sprintf/vsnprintf (replaces the SQLite stubs

@@ -12,21 +12,24 @@ use core::ffi::c_int;
 
 /// Run the interactive Lua REPL. Returns when the user types ^D.
 pub fn run() {
-    serial_println!("Lua 5.4.8  Copyright (C) 1994-2025 Lua.org, PUC-Rio");
+    serial_println!("Lua 5.5.0  Copyright (C) 1994-2025 Lua.org, PUC-Rio");
     serial_println!("Type ^D to exit.");
 
     unsafe {
         // REPL gets a larger limit (4 MiB) for interactive use
         let mut alloc_state = super::alloc::LuaAllocState::new(4 * super::alloc::LUA_MEM_LIMIT);
         let ud = &mut alloc_state as *mut super::alloc::LuaAllocState as *mut core::ffi::c_void;
-        let L = lua_newstate(heaven_lua_alloc, ud);
+        let L = lua_newstate(heaven_lua_alloc, ud, 0);
         if L.is_null() {
             serial_println!("[lua] ERROR: failed to create Lua state (out of memory)");
             return;
         }
 
         luaL_openlibs(L);
-        lua_gc(L, LUA_GCINC, 100 as core::ffi::c_int, 200 as core::ffi::c_int, 10 as core::ffi::c_int);
+        lua_gc(L, LUA_GCINC);
+        lua_gc(L, LUA_GCPARAM, LUA_GCPPAUSE as core::ffi::c_int, 100 as core::ffi::c_int);
+        lua_gc(L, LUA_GCPARAM, LUA_GCPSTEPMUL as core::ffi::c_int, 200 as core::ffi::c_int);
+        lua_gc(L, LUA_GCPARAM, LUA_GCPSTEPSIZE as core::ffi::c_int, 10 as core::ffi::c_int);
         register_builtins(L);
 
         // Store agent name for audit

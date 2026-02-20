@@ -1,4 +1,4 @@
-//! Lua 5.4.8 integration for HeavenOS.
+//! Lua 5.5.0 integration for HeavenOS.
 //!
 //! Provides:
 //! - `run_agent(path)`: load a Lua script from the namespace table and execute it
@@ -46,7 +46,7 @@ pub fn run_string(code: &str, name: &str) -> Result<(), String> {
         // 1. Create Lua state with our allocator (memory-limited)
         let mut alloc_state = alloc::LuaAllocState::new(alloc::LUA_MEM_LIMIT);
         let ud = &mut alloc_state as *mut alloc::LuaAllocState as *mut core::ffi::c_void;
-        let L = lua_newstate(alloc::heaven_lua_alloc, ud);
+        let L = lua_newstate(alloc::heaven_lua_alloc, ud, 0);
         if L.is_null() {
             return Err(String::from("failed to create Lua state (out of memory)"));
         }
@@ -55,7 +55,10 @@ pub fn run_string(code: &str, name: &str) -> Result<(), String> {
         luaL_openlibs(L);
 
         // 3. Configure GC for incremental mode with small steps
-        lua_gc(L, LUA_GCINC, 100 as c_int, 200 as c_int, 10 as c_int);
+        lua_gc(L, LUA_GCINC);
+        lua_gc(L, LUA_GCPARAM, LUA_GCPPAUSE as c_int, 100 as c_int);
+        lua_gc(L, LUA_GCPARAM, LUA_GCPSTEPMUL as c_int, 200 as c_int);
+        lua_gc(L, LUA_GCPARAM, LUA_GCPSTEPSIZE as c_int, 10 as c_int);
 
         // 4. Register OSqlite builtins
         builtins::register_builtins(L);

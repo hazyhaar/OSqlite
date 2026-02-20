@@ -1,4 +1,4 @@
-/* luaconf_heaven.h — OSqlite bare-metal overrides for Lua 5.4.8 */
+/* luaconf_heaven.h — OSqlite bare-metal overrides for Lua 5.5.0 */
 
 #ifndef LUACONF_HEAVEN_H
 #define LUACONF_HEAVEN_H
@@ -22,9 +22,6 @@ extern int  heaven_snprintf(char *buf, int count, const char *fmt, ...);
 #undef LUA_USE_DLOPEN
 #undef LUA_USE_READLINE
 #undef LUA_USE_C89
-
-/* ========== Stack limit — prevent runaway recursion ========== */
-#define LUAI_MAXSTACK   10000
 
 /* ========== Numbers — keep double + int64 (default) ========== */
 /* The kernel has FPU/SSE enabled. */
