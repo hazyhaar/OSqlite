@@ -418,11 +418,12 @@ double asin(double x);
 double acos(double x);
 double tan(double x);
 
-/* Reduce x to [-pi, pi] range */
+/* Reduce x to [-pi, pi] range using fmod (handles |x| > 2^52 correctly) */
+extern double fmod(double, double);
 static double _reduce_angle(double x) {
     const double TWO_PI = 6.28318530717958648;
     const double PI = 3.14159265358979324;
-    x = x - TWO_PI * (double)((long long)(x / TWO_PI));
+    x = fmod(x, TWO_PI);
     if (x > PI) x -= TWO_PI;
     if (x < -PI) x += TWO_PI;
     return x;

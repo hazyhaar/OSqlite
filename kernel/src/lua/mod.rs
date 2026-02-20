@@ -17,7 +17,7 @@ pub mod repl;
 use ::alloc::string::String;
 use ::alloc::vec::Vec;
 
-use core::ffi::c_void;
+use core::ffi::{c_int, c_void};
 
 use ffi::*;
 
@@ -55,7 +55,7 @@ pub fn run_string(code: &str, name: &str) -> Result<(), String> {
         luaL_openlibs(L);
 
         // 3. Configure GC for incremental mode with small steps
-        lua_gc(L, LUA_GCINC, 100, 200, 10);
+        lua_gc(L, LUA_GCINC, 100 as c_int, 200 as c_int, 10 as c_int);
 
         // 4. Register OSqlite builtins
         builtins::register_builtins(L);

@@ -572,8 +572,32 @@ int sprintf(char *buf, const char *fmt, ...) {
 double fabs(double x) { return x < 0 ? -x : x; }
 
 double fmod(double x, double y) {
-    if (y == 0.0) return 0.0;
-    return x - (double)((long long)(x / y)) * y;
+    if (y == 0.0) return 0.0 / 0.0; /* NaN */
+    /* Use repeated subtraction to avoid (long long) precision loss for large x.
+       First get a rough quotient, then refine. */
+    double q = x / y;
+    /* trunc(q) via bit manipulation: clear fractional bits */
+    /* For values within long long range, cast is fine; for huge values,
+       use a loop to subtract aligned multiples. */
+    if (q > -9007199254740992.0 && q < 9007199254740992.0) {
+        /* Within 2^53 — (long long) cast is exact */
+        double t = (double)((long long)q);
+        double r = x - t * y;
+        /* Ensure result has same sign as x */
+        if (r != 0.0 && ((r < 0.0) != (x < 0.0))) r += y;
+        return r;
+    }
+    /* Huge quotient: iteratively subtract powers of y */
+    double ax = x < 0 ? -x : x;
+    double ay = y < 0 ? -y : y;
+    /* Scale ay up to the same magnitude */
+    double scaled = ay;
+    while (scaled * 2.0 <= ax) scaled *= 2.0;
+    while (ax >= ay) {
+        if (ax >= scaled) ax -= scaled;
+        scaled *= 0.5;
+    }
+    return x < 0 ? -ax : ax;
 }
 
 double floor(double x) {
