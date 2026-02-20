@@ -3,6 +3,8 @@
 /// Provides an RDRAND-based RNG that implements `rand_core::CryptoRng`.
 /// RDRAND is a hardware random number generator available on Intel Ivy Bridge+
 /// and AMD Zen+. We verified its presence via CPUID during boot.
+pub mod der;
+pub mod pin_verifier;
 
 /// RDRAND-based cryptographically secure RNG.
 pub struct RdRandRng;

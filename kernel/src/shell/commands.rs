@@ -13,7 +13,8 @@ use spin::Mutex;
 use smoltcp::wire::Ipv4Address;
 
 /// Stored IP for api.anthropic.com (set via `resolve` command).
-/// Without DNS, the user must provide this. Default: 0.0.0.0 (not set).
+/// With DNS resolver (17.1), this is used as a manual override.
+/// If 0.0.0.0, the `ask` command will try DNS resolution first.
 static API_TARGET_IP: Mutex<Ipv4Address> = Mutex::new(Ipv4Address::new(0, 0, 0, 0));
 
 /// Dispatch a command line to the appropriate handler.
@@ -68,12 +69,13 @@ pub fn dispatch(line: &str) {
             cmd_resolve(&rest);
         }
         "model" => {
-            if let Some(name) = parts.next() {
-                serial_println!("model set to: {}", name);
-            } else {
-                serial_println!("current model: claude-sonnet-4-5-20250929");
-                serial_println!("usage: model <name>");
-            }
+            let rest: alloc::string::String = parts.collect::<alloc::vec::Vec<&str>>().join(" ");
+            cmd_model(&rest);
+        }
+        "pin" => {
+            let sub = parts.next().unwrap_or("show");
+            let rest: alloc::string::String = parts.collect::<alloc::vec::Vec<&str>>().join("");
+            cmd_pin(sub, &rest);
         }
         "sql" => {
             let rest: alloc::string::String = parts.collect::<alloc::vec::Vec<&str>>().join(" ");
@@ -83,6 +85,27 @@ pub fn dispatch(line: &str) {
                 cmd_sql(&rest);
             }
         }
+        "run" => {
+            if let Some(path) = parts.next() {
+                cmd_run(path);
+            } else {
+                serial_println!("usage: run <path>   (execute a Lua agent from namespace)");
+            }
+        }
+        "store" => {
+            // store <path> <code...>
+            if let Some(path) = parts.next() {
+                let code: alloc::string::String = parts.collect::<alloc::vec::Vec<&str>>().join(" ");
+                if code.is_empty() {
+                    serial_println!("usage: store <path> <lua code>");
+                } else {
+                    cmd_store(path, &code);
+                }
+            } else {
+                serial_println!("usage: store <path> <lua code>");
+            }
+        }
+        "lua" => cmd_lua_repl(),
         "clear" => cmd_clear(),
         "panic" => cmd_panic(),
         "reboot" => cmd_reboot(),
@@ -107,12 +130,18 @@ fn cmd_help() {
     serial_println!("  echo <text>   print text");
     serial_println!("  sql <stmt>    execute SQL on the system database");
     serial_println!();
+    serial_println!("Lua:");
+    serial_println!("  lua             interactive Lua REPL");
+    serial_println!("  run <path>      execute a Lua agent from namespace");
+    serial_println!("  store <p> <c>   store Lua script at path");
+    serial_println!();
     serial_println!("Claude API:");
     serial_println!("  apikey <key>     set Anthropic API key");
-    serial_println!("  resolve <ip>     set api.anthropic.com IP for TLS mode");
-    serial_println!("  ask <prompt>     send message via TLS (direct HTTPS)");
+    serial_println!("  resolve <ip>     set api.anthropic.com IP (override DNS)");
+    serial_println!("  ask <prompt>     send message via TLS (auto-resolves DNS)");
     serial_println!("  askp <prompt>    send message via proxy (plain HTTP)");
     serial_println!("  model <name>     set model (default: claude-sonnet-4-5-20250929)");
+    serial_println!("  pin [show|set]   manage TLS certificate SPKI pin");
     serial_println!();
     serial_println!("  clear         clear screen");
     serial_println!("  panic         trigger a kernel panic (for testing)");
@@ -212,20 +241,38 @@ fn cmd_ls(path: &str) {
 }
 
 fn cmd_cat(path: &str) {
-    // Map well-known paths to synthetic content.
-    // When the Styx server is wired in, this will Tread the file.
+    // Map well-known paths to synthetic content
     match path {
-        "/sys/meminfo" | "sys/meminfo" => cmd_meminfo(),
-        "/sys/uptime" | "sys/uptime" => cmd_uptime(),
-        "/hw/nvme/info" | "hw/nvme/info" => cmd_nvme_info(),
+        "/sys/meminfo" | "sys/meminfo" => { cmd_meminfo(); return; }
+        "/sys/uptime" | "sys/uptime" => { cmd_uptime(); return; }
+        "/hw/nvme/info" | "hw/nvme/info" => { cmd_nvme_info(); return; }
         "/db/schema" | "db/schema" => {
-            serial_println!("-- schema placeholder");
-            serial_println!("-- (SQLite not yet integrated)");
+            match crate::sqlite::exec_and_format(
+                "SELECT sql FROM sqlite_master WHERE type='table' ORDER BY name"
+            ) {
+                Ok(out) => serial_print!("{}", out),
+                Err(e) => serial_println!("error: {}", e),
+            }
+            return;
         }
-        _ => {
-            serial_println!("cat: {}: not found", path);
+        _ => {}
+    }
+
+    // Try reading from the namespace table (structured query — handles all content)
+    let guard = crate::sqlite::DB.lock();
+    if let Some(db) = guard.as_ref() {
+        let query = alloc::format!(
+            "SELECT content FROM namespace WHERE path='{}'",
+            path.replace('\'', "''")
+        );
+        if let Ok(Some(content)) = db.query_value(&query) {
+            drop(guard);
+            serial_println!("{}", content);
+            return;
         }
     }
+    drop(guard);
+    serial_println!("cat: {}: not found", path);
 }
 
 fn cmd_clear() {
@@ -280,11 +327,10 @@ fn cmd_resolve(ip_str: &str) {
     if ip_str.is_empty() {
         let current = *API_TARGET_IP.lock();
         if current == Ipv4Address::new(0, 0, 0, 0) {
-            serial_println!("API target: not set");
-            serial_println!("usage: resolve <ip>  (e.g. resolve 104.18.37.202)");
-            serial_println!("  Get IP: dig +short api.anthropic.com");
+            serial_println!("API target: not set (will use DNS)");
+            serial_println!("usage: resolve <ip>  (manual override)");
         } else {
-            serial_println!("API target: {}", current);
+            serial_println!("API target: {} (manual override)", current);
         }
         return;
     }
@@ -310,6 +356,17 @@ fn cmd_resolve(ip_str: &str) {
     serial_println!("API target set to: {}", ip);
 }
 
+fn cmd_model(name: &str) {
+    if name.is_empty() {
+        let current = crate::api::get_model();
+        serial_println!("current model: {}", current);
+        serial_println!("usage: model <name>");
+    } else {
+        crate::api::set_model(name);
+        serial_println!("model set to: {}", name);
+    }
+}
+
 fn cmd_ask(prompt: &str, use_tls: bool) {
     // Check API key
     let api_key = match crate::api::get_api_key() {
@@ -333,22 +390,41 @@ fn cmd_ask(prompt: &str, use_tls: bool) {
 
     // Build config based on mode
     let config = if use_tls {
-        let target_ip = *API_TARGET_IP.lock();
-        if target_ip == Ipv4Address::new(0, 0, 0, 0) {
-            serial_println!("Error: API IP not set. Run: resolve <ip>");
-            serial_println!("  Get IP on host: dig +short api.anthropic.com");
-            serial_println!("  Or use 'askp' for proxy mode.");
-            return;
-        }
+        // Check manual IP override first, then try DNS
+        let target_ip = {
+            let manual = *API_TARGET_IP.lock();
+            if manual != Ipv4Address::new(0, 0, 0, 0) {
+                serial_println!("[resolve: {} (manual)]", manual);
+                manual
+            } else {
+                // Try DNS resolution
+                serial_println!("[DNS resolve: api.anthropic.com...]");
+                match crate::net::dns::resolve_a(net, "api.anthropic.com") {
+                    Ok(ip) => {
+                        serial_println!("[resolved: {}]", ip);
+                        ip
+                    }
+                    Err(e) => {
+                        serial_println!("Error: DNS resolution failed: {}", e);
+                        serial_println!("  Fallback: resolve <ip>  (manual)");
+                        serial_println!("  Get IP on host: dig +short api.anthropic.com");
+                        return;
+                    }
+                }
+            }
+        };
+
         serial_println!("[TLS to {}:443...]", target_ip);
         crate::api::ClaudeConfig {
             api_key,
+            model: crate::api::get_model(),
             ..crate::api::ClaudeConfig::direct_tls(target_ip)
         }
     } else {
         serial_println!("[proxy mode: 10.0.2.2:8080...]");
         crate::api::ClaudeConfig {
             api_key,
+            model: crate::api::get_model(),
             ..crate::api::ClaudeConfig::default_proxy()
         }
     };
@@ -369,7 +445,7 @@ fn cmd_ask(prompt: &str, use_tls: bool) {
                 serial_println!();
                 serial_println!("TLS troubleshooting:");
                 serial_println!("  1. Verify QEMU has internet: -netdev user,id=net0");
-                serial_println!("  2. Verify IP: resolve <current-ip-of-api.anthropic.com>");
+                serial_println!("  2. Fallback: resolve <ip>  (manual override)");
                 serial_println!("  3. Fallback: askp <prompt> (uses socat proxy)");
             } else {
                 serial_println!();
@@ -379,6 +455,64 @@ fn cmd_ask(prompt: &str, use_tls: bool) {
             }
         }
     }
+}
+
+fn cmd_pin(sub: &str, arg: &str) {
+    match sub {
+        "show" | "" => {
+            if let Some(pin) = crate::crypto::pin_verifier::get_pin_override() {
+                serial_println!("SPKI pin (runtime override):");
+                serial_print!("  ");
+                for b in &pin {
+                    serial_print!("{:02x}", b);
+                }
+                serial_println!();
+            } else {
+                serial_println!("SPKI pin: using compiled-in pins");
+                serial_println!("  Pinning enforcement: {}", if crate::api::ENFORCE_PINNING { "ON" } else { "OFF" });
+            }
+        }
+        "set" => {
+            if arg.is_empty() {
+                serial_println!("usage: pin set <64-hex-chars>");
+                serial_println!("  Get pin: openssl s_client -connect api.anthropic.com:443 \\");
+                serial_println!("    | openssl x509 -pubkey -noout \\");
+                serial_println!("    | openssl pkey -pubin -outform der \\");
+                serial_println!("    | openssl dgst -sha256 -binary | xxd -p -c32");
+                return;
+            }
+            match parse_hex_hash(arg) {
+                Some(hash) => {
+                    crate::crypto::pin_verifier::set_pin_override(hash);
+                    serial_println!("SPKI pin override set ({} bytes)", hash.len());
+                }
+                None => {
+                    serial_println!("Invalid hex hash. Expected 64 hex characters (32 bytes SHA-256).");
+                }
+            }
+        }
+        "clear" => {
+            crate::crypto::pin_verifier::clear_pin_override();
+            serial_println!("SPKI pin override cleared. Using compiled-in pins.");
+        }
+        _ => {
+            serial_println!("usage: pin [show|set <hex>|clear]");
+        }
+    }
+}
+
+/// Parse a 64-character hex string into a 32-byte array.
+fn parse_hex_hash(hex: &str) -> Option<[u8; 32]> {
+    let hex = hex.trim();
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut result = [0u8; 32];
+    for i in 0..32 {
+        let byte_str = &hex[i * 2..i * 2 + 2];
+        result[i] = u8::from_str_radix(byte_str, 16).ok()?;
+    }
+    Some(result)
 }
 
 fn cmd_sql(query: &str) {
@@ -400,4 +534,39 @@ fn cmd_reboot() {
     loop {
         unsafe { core::arch::asm!("hlt"); }
     }
+}
+
+fn cmd_run(path: &str) {
+    serial_println!("[lua] running agent: {}", path);
+    match crate::lua::run_agent(path) {
+        Ok(()) => serial_println!("[lua] agent finished."),
+        Err(e) => serial_println!("[lua] error: {}", e),
+    }
+}
+
+fn cmd_store(path: &str, code: &str) {
+    let guard = crate::sqlite::DB.lock();
+    let db = match guard.as_ref() {
+        Some(db) => db,
+        None => {
+            serial_println!("error: database not open");
+            return;
+        }
+    };
+
+    let query = alloc::format!(
+        "INSERT OR REPLACE INTO namespace (path, type, content, mtime) \
+         VALUES ('{}', 'lua', '{}', strftime('%s','now'))",
+        path.replace('\'', "''"),
+        code.replace('\'', "''")
+    );
+
+    match db.exec(&query) {
+        Ok(()) => serial_println!("stored: {} ({} bytes)", path, code.len()),
+        Err(e) => serial_println!("error: {}", e),
+    }
+}
+
+fn cmd_lua_repl() {
+    crate::lua::repl::run();
 }

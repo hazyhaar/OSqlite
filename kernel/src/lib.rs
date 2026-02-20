@@ -24,6 +24,8 @@ pub mod shell;
 #[cfg(not(test))]
 pub mod sqlite;
 #[cfg(not(test))]
+pub mod lua;
+#[cfg(not(test))]
 pub mod vfs;
 
 // --- Test stubs for types referenced by the storage module ---

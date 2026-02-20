@@ -80,6 +80,12 @@ extern "C" {
 
     pub fn sqlite3_column_type(stmt: *mut sqlite3_stmt, iCol: c_int) -> c_int;
 
+    pub fn sqlite3_column_int64(stmt: *mut sqlite3_stmt, iCol: c_int) -> i64;
+
+    pub fn sqlite3_column_double(stmt: *mut sqlite3_stmt, iCol: c_int) -> f64;
+
+    pub fn sqlite3_column_bytes(stmt: *mut sqlite3_stmt, iCol: c_int) -> c_int;
+
     pub fn sqlite3_finalize(stmt: *mut sqlite3_stmt) -> c_int;
 }
 
@@ -88,6 +94,9 @@ const SQLITE_OPEN_READWRITE: c_int = 0x00000002;
 const SQLITE_OPEN_CREATE: c_int = 0x00000004;
 
 // Column types
+pub const SQLITE_INTEGER: c_int = 1;
+pub const SQLITE_FLOAT: c_int = 2;
+pub const SQLITE_TEXT: c_int = 3;
 const SQLITE_NULL: c_int = 5;
 
 /// Safe wrapper around a sqlite3 database connection.
@@ -242,6 +251,158 @@ impl SqliteDb {
         }
 
         Ok(output)
+    }
+}
+
+/// A typed column value from a SQLite row.
+#[derive(Clone, Debug)]
+pub enum SqlValue {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Text(String),
+}
+
+impl SqlValue {
+    /// Get as string, or None if NULL.
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            SqlValue::Text(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Get as i64, or None if not an integer.
+    pub fn as_integer(&self) -> Option<i64> {
+        match self {
+            SqlValue::Integer(n) => Some(*n),
+            _ => None,
+        }
+    }
+}
+
+/// A structured query result set.
+pub struct QueryResult {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<SqlValue>>,
+}
+
+impl SqliteDb {
+    /// Execute a query and return structured results.
+    ///
+    /// Unlike exec_with_results(), this handles values containing | and \n
+    /// correctly because it reads column values directly via sqlite3_column_*.
+    pub fn query(&self, sql: &str) -> Result<QueryResult, String> {
+        let mut sql_buf = Vec::with_capacity(sql.len() + 1);
+        sql_buf.extend_from_slice(sql.as_bytes());
+        sql_buf.push(0);
+
+        let mut stmt: *mut sqlite3_stmt = core::ptr::null_mut();
+
+        let rc = unsafe {
+            sqlite3_prepare_v2(
+                self.db,
+                sql_buf.as_ptr() as *const c_char,
+                sql_buf.len() as c_int,
+                &mut stmt,
+                core::ptr::null_mut(),
+            )
+        };
+
+        if rc != SQLITE_OK {
+            return Err(unsafe { errmsg_string(self.db) });
+        }
+
+        let ncols = unsafe { sqlite3_column_count(stmt) };
+
+        // Read column names
+        let mut columns = Vec::with_capacity(ncols as usize);
+        for i in 0..ncols {
+            let name = unsafe { sqlite3_column_name(stmt, i) };
+            columns.push(if !name.is_null() {
+                unsafe { cstr_to_string(name) }
+            } else {
+                String::new()
+            });
+        }
+
+        // Read rows
+        let mut rows = Vec::new();
+        loop {
+            let step_rc = unsafe { sqlite3_step(stmt) };
+            if step_rc == SQLITE_DONE {
+                break;
+            }
+            if step_rc != SQLITE_ROW {
+                let msg = unsafe { errmsg_string(self.db) };
+                unsafe { sqlite3_finalize(stmt); }
+                return Err(msg);
+            }
+
+            let mut row = Vec::with_capacity(ncols as usize);
+            for i in 0..ncols {
+                let col_type = unsafe { sqlite3_column_type(stmt, i) };
+                let val = match col_type {
+                    SQLITE_INTEGER => {
+                        SqlValue::Integer(unsafe { sqlite3_column_int64(stmt, i) })
+                    }
+                    SQLITE_FLOAT => {
+                        SqlValue::Real(unsafe { sqlite3_column_double(stmt, i) })
+                    }
+                    SQLITE_NULL => SqlValue::Null,
+                    _ => {
+                        // TEXT and BLOB — read as text
+                        let text = unsafe { sqlite3_column_text(stmt, i) };
+                        if !text.is_null() {
+                            SqlValue::Text(unsafe { cstr_to_string(text) })
+                        } else {
+                            SqlValue::Null
+                        }
+                    }
+                };
+                row.push(val);
+            }
+            rows.push(row);
+        }
+
+        unsafe { sqlite3_finalize(stmt); }
+
+        Ok(QueryResult { columns, rows })
+    }
+
+    /// Execute a query and return the first column of the first row as a String.
+    ///
+    /// Returns Ok(None) if no rows are returned.
+    pub fn query_value(&self, sql: &str) -> Result<Option<String>, String> {
+        let result = self.query(sql)?;
+        if let Some(row) = result.rows.first() {
+            if let Some(val) = row.first() {
+                return Ok(match val {
+                    SqlValue::Null => None,
+                    SqlValue::Integer(n) => Some(alloc::format!("{}", n)),
+                    SqlValue::Real(n) => Some(alloc::format!("{}", n)),
+                    SqlValue::Text(s) => Some(s.clone()),
+                });
+            }
+        }
+        Ok(None)
+    }
+
+    /// Execute a query and return the first column of all rows as strings.
+    pub fn query_column(&self, sql: &str) -> Result<Vec<String>, String> {
+        let result = self.query(sql)?;
+        let mut out = Vec::with_capacity(result.rows.len());
+        for row in &result.rows {
+            if let Some(val) = row.first() {
+                match val {
+                    SqlValue::Null => {}
+                    SqlValue::Integer(n) => out.push(alloc::format!("{}", n)),
+                    SqlValue::Real(n) => out.push(alloc::format!("{}", n)),
+                    SqlValue::Text(s) => out.push(s.clone()),
+                }
+            }
+        }
+        Ok(out)
     }
 }
 

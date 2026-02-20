@@ -469,6 +469,7 @@ dependencies = [
  "embedded-tls",
  "limine",
  "rand_core",
+ "sha2",
  "smoltcp",
  "spin",
  "static_assertions",
