@@ -37,17 +37,18 @@ impl RdRandRng {
 
 impl rand_core::RngCore for RdRandRng {
     fn next_u32(&mut self) -> u32 {
-        Self::rdrand64().unwrap_or(0) as u32
+        Self::rdrand64().expect("RDRAND failed after 32 retries — hardware RNG fault") as u32
     }
 
     fn next_u64(&mut self) -> u64 {
-        Self::rdrand64().unwrap_or(0)
+        Self::rdrand64().expect("RDRAND failed after 32 retries — hardware RNG fault")
     }
 
     fn fill_bytes(&mut self, dest: &mut [u8]) {
         let mut offset = 0;
         while offset < dest.len() {
-            let val = Self::rdrand64().unwrap_or(0);
+            let val = Self::rdrand64()
+                .expect("RDRAND failed after 32 retries — hardware RNG fault");
             let bytes = val.to_le_bytes();
             let remaining = dest.len() - offset;
             let copy_len = remaining.min(8);

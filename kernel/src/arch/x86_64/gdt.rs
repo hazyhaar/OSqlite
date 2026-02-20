@@ -4,6 +4,7 @@
 /// kernel DS descriptors. We also include a TSS with IST entries so
 /// the double-fault handler can use a dedicated stack, preventing
 /// triple faults on stack overflow.
+use core::cell::UnsafeCell;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -76,8 +77,28 @@ struct Tss {
 
 static_assertions::const_assert_eq!(size_of::<Tss>(), 104);
 
+/// Wrapper for single-core init-once statics that replaces `static mut`.
+/// Safety: only written during single-threaded boot, read-only afterwards.
+#[repr(transparent)]
+struct SyncUnsafeCell<T>(UnsafeCell<T>);
+unsafe impl<T> Sync for SyncUnsafeCell<T> {}
+
+impl<T> SyncUnsafeCell<T> {
+    const fn new(val: T) -> Self {
+        Self(UnsafeCell::new(val))
+    }
+    /// # Safety
+    /// Caller must ensure no concurrent access (single-threaded boot).
+    unsafe fn get_mut(&self) -> &mut T {
+        &mut *self.0.get()
+    }
+    fn as_ptr(&self) -> *const T {
+        self.0.get()
+    }
+}
+
 /// Static TSS — zeroed initially, IST1 set during boot.
-static mut TSS: Tss = Tss {
+static TSS: SyncUnsafeCell<Tss> = SyncUnsafeCell::new(Tss {
     _reserved0: 0,
     rsp0: 0,
     rsp1: 0,
@@ -93,7 +114,7 @@ static mut TSS: Tss = Tss {
     _reserved2: 0,
     _reserved3: 0,
     iopb: size_of::<Tss>() as u16, // No I/O permission bitmap
-};
+});
 
 /// GDT layout: null + kernel code + kernel data + TSS (16 bytes = 2 entries)
 /// TSS descriptor in long mode is 16 bytes, occupying entries 3 and 4.
@@ -110,7 +131,7 @@ struct GdtPointer {
 }
 
 /// Static GDT — TSS entries filled dynamically during init.
-static mut GDT: Gdt = Gdt {
+static GDT: SyncUnsafeCell<Gdt> = SyncUnsafeCell::new(Gdt {
     entries: [
         GdtEntry::null(),        // 0x00: null
         GdtEntry::kernel_code(), // 0x08: kernel CS
@@ -118,7 +139,7 @@ static mut GDT: Gdt = Gdt {
         GdtEntry::null(),        // 0x18: TSS low (set in init)
         GdtEntry::null(),        // 0x20: TSS high (set in init)
     ],
-};
+});
 
 /// Kernel code segment selector.
 pub const KERNEL_CS: u16 = 0x08;
@@ -161,17 +182,18 @@ fn tss_descriptor(base: u64, limit: u32) -> (u64, u64) {
 /// # Safety
 /// Must be called exactly once, early in boot, before loading the IDT.
 pub unsafe fn init() {
-    let tss_addr = &raw const TSS as u64;
+    let tss_addr = TSS.as_ptr() as u64;
     let tss_limit = (size_of::<Tss>() - 1) as u32;
     let (tss_low, tss_high) = tss_descriptor(tss_addr, tss_limit);
 
     // Fill TSS descriptor entries in the GDT
-    GDT.entries[3] = GdtEntry(tss_low);
-    GDT.entries[4] = GdtEntry(tss_high);
+    let gdt = GDT.get_mut();
+    gdt.entries[3] = GdtEntry(tss_low);
+    gdt.entries[4] = GdtEntry(tss_high);
 
     let ptr = GdtPointer {
         limit: (size_of::<Gdt>() - 1) as u16,
-        base: &raw const GDT as u64,
+        base: GDT.as_ptr() as u64,
     };
 
     core::arch::asm!(
@@ -213,6 +235,6 @@ pub unsafe fn init() {
 /// Must be called after the physical allocator is initialized and before
 /// any code that could cause a double fault.
 pub unsafe fn set_ist1(stack_top: u64) {
-    TSS.ist1 = stack_top;
+    TSS.get_mut().ist1 = stack_top;
     IST1_STACK_TOP.store(stack_top, Ordering::Release);
 }

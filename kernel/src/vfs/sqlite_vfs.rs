@@ -15,9 +15,88 @@ use core::sync::atomic::Ordering;
 use alloc::vec::Vec;
 use spin::Mutex;
 
-use crate::drivers::nvme::NVME;
+use crate::drivers::nvme::{NVME, NvmeDriver};
 use crate::mem::DmaBuf;
 use crate::storage::{BlockAllocator, FileTable};
+
+/// Maximum blocks per single NVMe I/O command (u16::MAX).
+const MAX_BLOCKS_PER_IO: u64 = u16::MAX as u64;
+
+/// Read blocks from NVMe, splitting into chunks if block_count exceeds u16::MAX.
+fn chunked_read(
+    nvme: &mut NvmeDriver,
+    start_lba: u64,
+    block_count: u64,
+    dma: &mut DmaBuf,
+    block_size: u32,
+) -> Result<(), ()> {
+    let mut remaining = block_count;
+    let mut lba = start_lba;
+    let mut byte_offset = 0usize;
+
+    while remaining > 0 {
+        let chunk = remaining.min(MAX_BLOCKS_PER_IO) as u16;
+        let chunk_bytes = chunk as usize * block_size as usize;
+
+        if remaining == block_count && chunk as u64 == block_count {
+            // Single chunk — use the DMA buffer directly
+            if nvme.read_blocks(lba, chunk, dma).is_err() {
+                return Err(());
+            }
+        } else {
+            // Multiple chunks — read into a temporary buffer and copy
+            let mut tmp = DmaBuf::alloc(chunk_bytes).map_err(|_| ())?;
+            if nvme.read_blocks(lba, chunk, &mut tmp).is_err() {
+                return Err(());
+            }
+            dma.as_mut_slice()[byte_offset..byte_offset + chunk_bytes]
+                .copy_from_slice(&tmp.as_slice()[..chunk_bytes]);
+        }
+
+        remaining -= chunk as u64;
+        lba += chunk as u64;
+        byte_offset += chunk_bytes;
+    }
+    Ok(())
+}
+
+/// Write blocks to NVMe, splitting into chunks if block_count exceeds u16::MAX.
+fn chunked_write(
+    nvme: &mut NvmeDriver,
+    start_lba: u64,
+    block_count: u64,
+    dma: &DmaBuf,
+    block_size: u32,
+) -> Result<(), ()> {
+    let mut remaining = block_count;
+    let mut lba = start_lba;
+    let mut byte_offset = 0usize;
+
+    while remaining > 0 {
+        let chunk = remaining.min(MAX_BLOCKS_PER_IO) as u16;
+        let chunk_bytes = chunk as usize * block_size as usize;
+
+        if remaining == block_count && chunk as u64 == block_count {
+            // Single chunk — use the DMA buffer directly
+            if nvme.write_blocks(lba, chunk, dma).is_err() {
+                return Err(());
+            }
+        } else {
+            // Multiple chunks — copy slice into a temporary buffer and write
+            let mut tmp = DmaBuf::alloc(chunk_bytes).map_err(|_| ())?;
+            tmp.as_mut_slice()[..chunk_bytes]
+                .copy_from_slice(&dma.as_slice()[byte_offset..byte_offset + chunk_bytes]);
+            if nvme.write_blocks(lba, chunk, &tmp).is_err() {
+                return Err(());
+            }
+        }
+
+        remaining -= chunk as u64;
+        lba += chunk as u64;
+        byte_offset += chunk_bytes;
+    }
+    Ok(())
+}
 
 // ---- SQLite constants (from sqlite3.h) ----
 
@@ -235,8 +314,8 @@ impl HeavenVfs {
             Err(_) => return SQLITE_IOERR_NOMEM,
         };
 
-        // NVMe read
-        if let Err(_) = nvme.read_blocks(start_lba, block_count as u16, &mut dma) {
+        // NVMe read (chunked for large I/O that exceeds u16::MAX blocks)
+        if chunked_read(nvme, start_lba, block_count, &mut dma, file.block_size).is_err() {
             return SQLITE_IOERR_READ;
         }
 
@@ -368,7 +447,7 @@ impl HeavenVfs {
             };
             dma.copy_from_slice(data);
 
-            if let Err(_) = nvme.write_blocks(start_lba, block_count as u16, &dma) {
+            if chunked_write(nvme, start_lba, block_count, &dma, file.block_size).is_err() {
                 return SQLITE_IOERR_WRITE;
             }
         } else {
@@ -378,8 +457,8 @@ impl HeavenVfs {
                 Err(_) => return SQLITE_IOERR_NOMEM,
             };
 
-            // 1. READ existing blocks
-            if let Err(_) = nvme.read_blocks(start_lba, block_count as u16, &mut dma) {
+            // 1. READ existing blocks (chunked for large I/O)
+            if chunked_read(nvme, start_lba, block_count, &mut dma, file.block_size).is_err() {
                 return SQLITE_IOERR_READ;
             }
 
@@ -388,8 +467,8 @@ impl HeavenVfs {
             dst[byte_offset_in_first_block..byte_offset_in_first_block + amount]
                 .copy_from_slice(data);
 
-            // 3. WRITE back
-            if let Err(_) = nvme.write_blocks(start_lba, block_count as u16, &dma) {
+            // 3. WRITE back (chunked for large I/O)
+            if chunked_write(nvme, start_lba, block_count, &dma, file.block_size).is_err() {
                 return SQLITE_IOERR_WRITE;
             }
         }
@@ -693,21 +772,39 @@ fn bcd_to_bin(val: u8) -> u8 {
     (val & 0x0F) + (val >> 4) * 10
 }
 
-/// Read date/time from CMOS RTC. Waits for a stable read (no update in progress).
-/// Returns (year, month, day, hour, minute, second) in UTC.
-fn read_cmos_rtc() -> (u32, u32, u32, u32, u32, u32) {
+/// Read a single snapshot of all RTC registers.
+fn read_rtc_snapshot() -> (u8, u8, u8, u8, u8, u8, u8) {
     // Wait until RTC is not updating (bit 7 of register 0x0A).
     while cmos_read(0x0A) & 0x80 != 0 {
         core::hint::spin_loop();
     }
+    (
+        cmos_read(0x00), // sec
+        cmos_read(0x02), // min
+        cmos_read(0x04), // hour
+        cmos_read(0x07), // day
+        cmos_read(0x08), // month
+        cmos_read(0x09), // year
+        cmos_read(0x32), // century
+    )
+}
 
-    let sec = cmos_read(0x00);
-    let min = cmos_read(0x02);
-    let hour = cmos_read(0x04);
-    let day = cmos_read(0x07);
-    let month = cmos_read(0x08);
-    let year = cmos_read(0x09);
-    let century = cmos_read(0x32); // ACPI century register (may be 0)
+/// Read date/time from CMOS RTC using the double-read algorithm for
+/// consistency. The RTC may start a new update cycle between individual
+/// register reads, so we read twice and compare. If they differ, we
+/// retry until we get two consecutive identical reads.
+/// Returns (year, month, day, hour, minute, second) in UTC.
+fn read_cmos_rtc() -> (u32, u32, u32, u32, u32, u32) {
+    let (sec, min, hour, day, month, year, century);
+    let mut prev = read_rtc_snapshot();
+    loop {
+        let curr = read_rtc_snapshot();
+        if curr == prev {
+            (sec, min, hour, day, month, year, century) = curr;
+            break;
+        }
+        prev = curr;
+    }
 
     // Check status register B for BCD vs binary mode.
     let status_b = cmos_read(0x0B);

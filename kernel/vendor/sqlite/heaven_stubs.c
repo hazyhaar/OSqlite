@@ -110,9 +110,64 @@ int tolower(int c) { return isupper(c) ? c + 32 : c; }
  * SQLite uses these for number parsing. Minimal implementations.
  * ==================================================================== */
 
-long strtol(const char *nptr, char **endptr, int base) {
+/* Primary 64-bit implementation with overflow detection. */
+long long strtoll(const char *nptr, char **endptr, int base) {
     const char *s = nptr;
-    long result = 0;
+    long long result = 0;
+    int neg = 0;
+    int any = 0;
+
+    while (isspace(*s)) s++;
+    if (*s == '-') { neg = 1; s++; }
+    else if (*s == '+') { s++; }
+
+    if (base == 0) {
+        if (*s == '0' && (s[1] == 'x' || s[1] == 'X')) { base = 16; s += 2; }
+        else if (*s == '0') { base = 8; }
+        else { base = 10; }
+    } else if (base == 16 && *s == '0' && (s[1] == 'x' || s[1] == 'X')) {
+        s += 2;
+    }
+
+    /* Overflow limits for the positive case: LLONG_MAX = 9223372036854775807 */
+    long long cutoff = neg ? -((-9223372036854775807LL - 1) / base) : 9223372036854775807LL / base;
+    int cutlim = (int)(neg ? -((-9223372036854775807LL - 1) % base) : 9223372036854775807LL % base);
+
+    while (*s) {
+        int digit;
+        if (*s >= '0' && *s <= '9') digit = *s - '0';
+        else if (*s >= 'a' && *s <= 'z') digit = *s - 'a' + 10;
+        else if (*s >= 'A' && *s <= 'Z') digit = *s - 'A' + 10;
+        else break;
+        if (digit >= base) break;
+        any = 1;
+        /* Overflow check before multiply+add */
+        if (result > cutoff || (result == cutoff && digit > cutlim)) {
+            /* Overflow: clamp to LLONG_MAX / LLONG_MIN */
+            result = neg ? (-9223372036854775807LL - 1) : 9223372036854775807LL;
+            neg = 0; /* already applied sign in clamp */
+            /* Skip remaining digits */
+            s++;
+            while (*s) {
+                if (*s >= '0' && *s <= '9') { s++; continue; }
+                if (*s >= 'a' && *s <= 'z') { int d = *s - 'a' + 10; if (d < base) { s++; continue; } }
+                if (*s >= 'A' && *s <= 'Z') { int d = *s - 'A' + 10; if (d < base) { s++; continue; } }
+                break;
+            }
+            if (endptr) *endptr = (char *)s;
+            return result;
+        }
+        result = result * base + digit;
+        s++;
+    }
+
+    if (endptr) *endptr = (char *)s;
+    return neg ? -result : result;
+}
+
+unsigned long long strtoull(const char *nptr, char **endptr, int base) {
+    const char *s = nptr;
+    unsigned long long result = 0;
     int neg = 0;
 
     while (isspace(*s)) s++;
@@ -127,6 +182,9 @@ long strtol(const char *nptr, char **endptr, int base) {
         s += 2;
     }
 
+    unsigned long long cutoff = 18446744073709551615ULL / (unsigned long long)base;
+    unsigned long long cutlim = 18446744073709551615ULL % (unsigned long long)base;
+
     while (*s) {
         int digit;
         if (*s >= '0' && *s <= '9') digit = *s - '0';
@@ -134,24 +192,35 @@ long strtol(const char *nptr, char **endptr, int base) {
         else if (*s >= 'A' && *s <= 'Z') digit = *s - 'A' + 10;
         else break;
         if (digit >= base) break;
-        result = result * base + digit;
+        /* Overflow check */
+        if (result > cutoff || (result == cutoff && (unsigned long long)digit > cutlim)) {
+            result = 18446744073709551615ULL;
+            s++;
+            while (*s) {
+                if (*s >= '0' && *s <= '9') { s++; continue; }
+                if (*s >= 'a' && *s <= 'z') { int d = *s - 'a' + 10; if (d < base) { s++; continue; } }
+                if (*s >= 'A' && *s <= 'Z') { int d = *s - 'A' + 10; if (d < base) { s++; continue; } }
+                break;
+            }
+            if (endptr) *endptr = (char *)s;
+            return neg ? (unsigned long long)(-(long long)result) : result;
+        }
+        result = result * (unsigned long long)base + (unsigned long long)digit;
         s++;
     }
 
     if (endptr) *endptr = (char *)s;
-    return neg ? -result : result;
+    return neg ? (unsigned long long)(-(long long)result) : result;
+}
+
+/* strtol and strtoul delegate to 64-bit versions (safe narrowing on x86_64
+   where long == 64-bit). */
+long strtol(const char *nptr, char **endptr, int base) {
+    return (long)strtoll(nptr, endptr, base);
 }
 
 unsigned long strtoul(const char *nptr, char **endptr, int base) {
-    return (unsigned long)strtol(nptr, endptr, base);
-}
-
-long long strtoll(const char *nptr, char **endptr, int base) {
-    return (long long)strtol(nptr, endptr, base);
-}
-
-unsigned long long strtoull(const char *nptr, char **endptr, int base) {
-    return (unsigned long long)strtol(nptr, endptr, base);
+    return (unsigned long)strtoull(nptr, endptr, base);
 }
 
 double strtod(const char *nptr, char **endptr) {
@@ -483,13 +552,14 @@ int snprintf(char *buf, size_t n, const char *fmt, ...) {
 }
 
 int sprintf(char *buf, const char *fmt, ...) {
-    /* sprintf is inherently unsafe (no size limit). We use a reasonable
-     * upper bound — SQLite internally only uses snprintf, but strtod or
-     * other stubs may call sprintf with small buffers. 1024 is a safe
-     * default that covers number formatting. */
+    /* sprintf is inherently unsafe (no size limit). We pass SIZE_MAX so
+     * vsnprintf never truncates — the caller is responsible for providing
+     * a large enough buffer, as per the C standard.  SQLite internally
+     * uses sqlite3_snprintf (bounded), but libc math/string helpers may
+     * call sprintf for number formatting into known-size buffers. */
     va_list ap;
     va_start(ap, fmt);
-    int ret = vsnprintf(buf, 1024, fmt, ap);
+    int ret = vsnprintf(buf, (size_t)-1, fmt, ap);
     va_end(ap);
     return ret;
 }
@@ -723,8 +793,18 @@ void abort(void) {
 /* qsort — SQLite uses this for ORDER BY etc. Simple shell sort. */
 void qsort(void *base, size_t nel, size_t width, int (*compar)(const void *, const void *)) {
     char *arr = (char *)base;
-    char tmp[256]; /* max element size — SQLite structs are < 256 bytes */
-    if (width > sizeof(tmp)) return; /* safety */
+    char stack_tmp[512]; /* covers SQLite sort records (typically < 500 bytes) */
+    char *tmp;
+    int heap_allocated = 0;
+
+    if (width <= sizeof(stack_tmp)) {
+        tmp = stack_tmp;
+    } else {
+        /* Fall back to heap for unusually large elements */
+        tmp = (char *)heavenos_malloc(width);
+        if (!tmp) return; /* OOM — cannot sort */
+        heap_allocated = 1;
+    }
 
     /* Shell sort — simple, in-place, adequate for SQLite's needs */
     for (size_t gap = nel / 2; gap > 0; gap /= 2) {
@@ -738,6 +818,8 @@ void qsort(void *base, size_t nel, size_t width, int (*compar)(const void *, con
             memcpy(arr + j * width, tmp, width);
         }
     }
+
+    if (heap_allocated) heavenos_free(tmp);
 }
 
 /* bsearch */
