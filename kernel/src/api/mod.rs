@@ -67,7 +67,7 @@ impl ClaudeConfig {
             api_key: String::from(""),
             target_ip: Ipv4Address::new(10, 0, 2, 2),
             target_port: 8080,
-            model: String::from("claude-sonnet-4-5-20250929"),
+            model: String::from("claude-sonnet-4-6-20250514"),
             use_tls: false,
         }
     }
@@ -78,7 +78,7 @@ impl ClaudeConfig {
             api_key: String::from(""),
             target_ip,
             target_port: 443,
-            model: String::from("claude-sonnet-4-5-20250929"),
+            model: String::from("claude-sonnet-4-6-20250514"),
             use_tls: true,
         }
     }
@@ -219,13 +219,19 @@ where
 
         match result {
             Ok(response) => return Ok(response),
-            Err(ApiError::HttpStatus(status, ref msg)) => {
+            Err(ApiError::HttpStatus(status, ref msg, retry_after)) => {
                 // Retry on server errors, not client errors
                 if status == 429 || status == 500 || status == 529 {
-                    last_err = ApiError::HttpStatus(status, msg.clone());
+                    // Honor Retry-After header if present (e.g. 429)
+                    if let Some(secs) = retry_after {
+                        let wait_ms = (secs * 1000).min(60_000);
+                        crate::serial_println!("[API] Retry-After: {}s", secs);
+                        crate::arch::x86_64::timer::delay_us(wait_ms * 1000);
+                    }
+                    last_err = ApiError::HttpStatus(status, msg.clone(), retry_after);
                     continue;
                 }
-                return Err(ApiError::HttpStatus(status, msg.clone()));
+                return Err(ApiError::HttpStatus(status, msg.clone(), retry_after));
             }
             Err(ApiError::ConnectionTimeout) | Err(ApiError::ConnectionFailed) => {
                 last_err = ApiError::ConnectionTimeout;
@@ -326,8 +332,9 @@ where
                     if let Ok(resp) = http::HttpResponse::parse(&raw_buf) {
                         headers_parsed = true;
                         if let Some(err_msg) = resp.error_message() {
+                            let retry = resp.retry_after_secs();
                             let _ = tls.close();
-                            return Err(ApiError::HttpStatus(resp.status, String::from(err_msg)));
+                            return Err(ApiError::HttpStatus(resp.status, String::from(err_msg), retry));
                         }
                         // Strip headers from buffer, keep body
                         raw_buf = raw_buf[resp.body_start..].to_vec();
@@ -409,8 +416,9 @@ where
                     if let Ok(resp) = http::HttpResponse::parse(&raw_buf) {
                         headers_parsed = true;
                         if let Some(err_msg) = resp.error_message() {
+                            let retry = resp.retry_after_secs();
                             net.tcp_close(handle);
-                            return Err(ApiError::HttpStatus(resp.status, String::from(err_msg)));
+                            return Err(ApiError::HttpStatus(resp.status, String::from(err_msg), retry));
                         }
                         raw_buf = raw_buf[resp.body_start..].to_vec();
                     }
@@ -652,8 +660,8 @@ pub enum ApiError {
     SendFailed,
     EmptyResponse,
     DnsError(String),
-    /// HTTP error with status code and human-readable message.
-    HttpStatus(u16, String),
+    /// HTTP error with status code, human-readable message, and optional retry-after (secs).
+    HttpStatus(u16, String, Option<u64>),
     ApiError(String),
 }
 
@@ -666,7 +674,7 @@ impl core::fmt::Display for ApiError {
             ApiError::SendFailed => write!(f, "failed to send request"),
             ApiError::EmptyResponse => write!(f, "empty response from API"),
             ApiError::DnsError(msg) => write!(f, "DNS error: {}", msg),
-            ApiError::HttpStatus(code, msg) => write!(f, "HTTP {}: {}", code, msg),
+            ApiError::HttpStatus(code, msg, _) => write!(f, "HTTP {}: {}", code, msg),
             ApiError::ApiError(msg) => write!(f, "API error: {}", msg),
         }
     }
@@ -691,5 +699,5 @@ pub fn set_model(model: &str) {
 }
 
 pub fn get_model() -> String {
-    MODEL.lock().clone().unwrap_or_else(|| String::from("claude-sonnet-4-5-20250929"))
+    MODEL.lock().clone().unwrap_or_else(|| String::from("claude-sonnet-4-6-20250514"))
 }

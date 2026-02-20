@@ -133,14 +133,20 @@ pub fn resolve_a(net: &mut NetStack, hostname: &str) -> Result<Ipv4Address, DnsE
     if let Ok((ip, ttl)) = result {
         let expires = now_ms + (ttl as u64 * 1000).min(300_000); // cap at 5 min
         let mut cache = DNS_CACHE.lock();
-        // Find empty slot or oldest entry
+        // Find best slot: prefer empty > same hostname > expired > oldest
         let mut slot = 0;
+        let mut oldest_expires = u64::MAX;
         for (i, entry) in cache.iter().enumerate() {
             match entry {
                 None => { slot = i; break; }
                 Some(e) if e.hostname == hostname => { slot = i; break; }
                 Some(e) if e.expires_ms < now_ms => { slot = i; break; }
-                _ => { slot = i; } // overwrite last
+                Some(e) => {
+                    if e.expires_ms < oldest_expires {
+                        oldest_expires = e.expires_ms;
+                        slot = i;
+                    }
+                }
             }
         }
         cache[slot] = Some(CacheEntry {

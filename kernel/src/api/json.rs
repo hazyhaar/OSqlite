@@ -200,8 +200,21 @@ impl<'a> Parser<'a> {
                     }
                 }
                 Some(b) => {
-                    // UTF-8 passthrough
-                    s.push(b as char);
+                    // UTF-8 passthrough — handle multi-byte sequences
+                    if b < 0x80 {
+                        s.push(b as char);
+                    } else {
+                        let extra = if b < 0xE0 { 1 } else if b < 0xF0 { 2 } else { 3 };
+                        let mut buf = [b, 0, 0, 0];
+                        for i in 0..extra {
+                            buf[i + 1] = self.next_byte().ok_or(JsonError::UnexpectedEof)?;
+                        }
+                        if let Ok(ch_str) = core::str::from_utf8(&buf[..extra + 1]) {
+                            for ch in ch_str.chars() {
+                                s.push(ch);
+                            }
+                        }
+                    }
                 }
                 None => return Err(JsonError::UnexpectedEof),
             }
@@ -507,6 +520,16 @@ mod tests {
         assert_eq!(v.get("type").unwrap().as_str(), Some("content_block_delta"));
         let delta = v.get("delta").unwrap();
         assert_eq!(delta.get("text").unwrap().as_str(), Some("Hello, world!"));
+    }
+
+    #[test]
+    fn test_parse_utf8_multibyte() {
+        // French accents (2-byte UTF-8)
+        assert_eq!(parse(r#""café""#).unwrap().as_str(), Some("café"));
+        // Emoji (4-byte UTF-8)
+        assert_eq!(parse("\"hello \u{1F600}\"").unwrap().as_str(), Some("hello \u{1F600}"));
+        // Chinese (3-byte UTF-8)
+        assert_eq!(parse(r#""你好""#).unwrap().as_str(), Some("你好"));
     }
 
     #[test]
