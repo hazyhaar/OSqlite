@@ -22,8 +22,10 @@ extern "C" {
     pub fn lua_pushlstring(L: *mut LuaState, s: *const c_char, len: usize) -> *const c_char;
     pub fn lua_pushcclosure(L: *mut LuaState, f: LuaCFunction, n: c_int);
     pub fn lua_pushboolean(L: *mut LuaState, b: c_int);
+    pub fn lua_pushlightuserdata(L: *mut LuaState, p: *mut c_void);
 
     // === Getters ===
+    pub fn lua_touserdata(L: *mut LuaState, idx: c_int) -> *mut c_void;
     pub fn lua_tointegerx(L: *mut LuaState, idx: c_int, isnum: *mut c_int) -> i64;
     pub fn lua_tonumberx(L: *mut LuaState, idx: c_int, isnum: *mut c_int) -> f64;
     pub fn lua_tolstring(L: *mut LuaState, idx: c_int, len: *mut usize) -> *const c_char;
@@ -83,6 +85,7 @@ pub const LUA_ERRMEM: c_int = 4;
 
 pub const LUA_TNIL: c_int = 0;
 pub const LUA_TBOOLEAN: c_int = 1;
+pub const LUA_TLIGHTUSERDATA: c_int = 2;
 pub const LUA_TNUMBER: c_int = 3;
 pub const LUA_TSTRING: c_int = 4;
 pub const LUA_TTABLE: c_int = 5;

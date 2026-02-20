@@ -92,16 +92,11 @@ fn load_script_from_db(path: &str) -> Result<String, String> {
         path.replace('\'', "''")
     );
 
-    let result = db.exec_with_results(&query)?;
-
-    // exec_with_results returns "header\nrow1\n..." — skip the header line.
-    // Content may contain embedded newlines, so join all lines after the header.
-    let lines: Vec<&str> = result.lines().collect();
-    if lines.len() < 2 {
-        return Err(::alloc::format!("agent not found: {}", path));
+    match db.query_value(&query) {
+        Ok(Some(content)) => Ok(content),
+        Ok(None) => Err(::alloc::format!("agent not found: {}", path)),
+        Err(e) => Err(e),
     }
-
-    Ok(lines[1..].join("\n"))
 }
 
 /// Store the agent name in the Lua registry so builtins can read it for audit.

@@ -255,25 +255,17 @@ fn cmd_cat(path: &str) {
         _ => {}
     }
 
-    // Try reading from the namespace table
+    // Try reading from the namespace table (structured query — handles all content)
     let guard = crate::sqlite::DB.lock();
     if let Some(db) = guard.as_ref() {
         let query = alloc::format!(
             "SELECT content FROM namespace WHERE path='{}'",
             path.replace('\'', "''")
         );
-        match db.exec_with_results(&query) {
-            Ok(output) => {
-                let lines: alloc::vec::Vec<&str> = output.lines().collect();
-                if lines.len() >= 2 {
-                    // Content may contain embedded newlines — print all lines after header
-                    for line in &lines[1..] {
-                        serial_println!("{}", line);
-                    }
-                    return;
-                }
-            }
-            Err(_) => {}
+        if let Ok(Some(content)) = db.query_value(&query) {
+            drop(guard);
+            serial_println!("{}", content);
+            return;
         }
     }
     drop(guard);
@@ -473,7 +465,8 @@ fn cmd_store(path: &str, code: &str) {
     };
 
     let query = alloc::format!(
-        "INSERT OR REPLACE INTO namespace (path, type, content) VALUES ('{}', 'lua', '{}')",
+        "INSERT OR REPLACE INTO namespace (path, type, content, mtime) \
+         VALUES ('{}', 'lua', '{}', strftime('%s','now'))",
         path.replace('\'', "''"),
         code.replace('\'', "''")
     );

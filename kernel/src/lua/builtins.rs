@@ -11,6 +11,7 @@
 
 use core::ffi::{c_char, c_int};
 use super::ffi::*;
+use crate::sqlite::SqlValue;
 
 /// Register all OSqlite builtins in a Lua state.
 pub unsafe fn register_builtins(L: *mut LuaState) {
@@ -63,7 +64,7 @@ unsafe extern "C" fn lua_sql(L: *mut LuaState) -> c_int {
         }
     }
 
-    // Use the SQLite database
+    // Use the SQLite database — structured query API
     let guard = crate::sqlite::DB.lock();
     let db = match guard.as_ref() {
         Some(db) => db,
@@ -74,72 +75,71 @@ unsafe extern "C" fn lua_sql(L: *mut LuaState) -> c_int {
         }
     };
 
-    // Execute via the prepared statement API for results
-    match db.exec_with_results(query) {
-        Ok(output) => {
-            // Parse the pipe-delimited output into Lua tables
-            // Format: "col1|col2\nval1|val2\nval3|val4\n"
-            let lines: alloc::vec::Vec<&str> = output.lines().collect();
-
-            if lines.is_empty() || output.trim() == "OK" {
+    match db.query(query) {
+        Ok(result) => {
+            if result.columns.is_empty() {
                 // DDL/DML — return true
+                drop(guard);
+                audit_log(L, "SQL_EXEC", query);
                 lua_pushboolean(L, 1);
                 return 1;
             }
 
-            // First line is headers
-            let headers: alloc::vec::Vec<&str> = lines[0].split('|').collect();
+            // Build Lua result table from typed rows
+            lua_createtable(L, result.rows.len() as c_int, 0);
 
-            // Create result table
-            lua_createtable(L, (lines.len() - 1) as c_int, 0);
+            for (row_idx, row) in result.rows.iter().enumerate() {
+                // Create row table {col_name = value, ...}
+                lua_createtable(L, 0, result.columns.len() as c_int);
 
-            for (row_idx, line) in lines[1..].iter().enumerate() {
-                let values: alloc::vec::Vec<&str> = line.split('|').collect();
+                for (col_idx, val) in row.iter().enumerate() {
+                    // Push typed value
+                    push_sql_value(L, val);
 
-                // Create row table
-                lua_createtable(L, 0, headers.len() as c_int);
-
-                for (col_idx, header) in headers.iter().enumerate() {
-                    let val = values.get(col_idx).unwrap_or(&"");
-
-                    // Push value (try integer, then number, then string)
-                    if *val == "NULL" {
-                        lua_pushnil(L);
-                    } else if let Ok(n) = val.parse::<i64>() {
-                        lua_pushinteger(L, n);
-                    } else if let Ok(n) = val.parse::<f64>() {
-                        lua_pushnumber(L, n);
-                    } else {
-                        lua_pushlstring(L, val.as_ptr() as *const c_char, val.len());
+                    // Set field: row[column_name] = value
+                    if let Some(col_name) = result.columns.get(col_idx) {
+                        let mut hdr_buf = alloc::vec::Vec::with_capacity(col_name.len() + 1);
+                        hdr_buf.extend_from_slice(col_name.as_bytes());
+                        hdr_buf.push(0);
+                        lua_setfield(L, -2, hdr_buf.as_ptr() as *const c_char);
                     }
-
-                    // Null-terminate header name for setfield
-                    let mut hdr_buf = alloc::vec::Vec::with_capacity(header.len() + 1);
-                    hdr_buf.extend_from_slice(header.as_bytes());
-                    hdr_buf.push(0);
-                    lua_setfield(L, -2, hdr_buf.as_ptr() as *const c_char);
                 }
 
                 // result[row_idx+1] = row
                 lua_rawseti(L, -2, (row_idx + 1) as i64);
             }
 
-            // Log to audit
             drop(guard);
             audit_log(L, "SQL_EXEC", query);
-
             1 // return the result table
         }
         Err(e) => {
             drop(guard);
             lua_pushnil(L);
-            let mut msg_buf = alloc::vec::Vec::with_capacity(e.len() + 1);
-            msg_buf.extend_from_slice(e.as_bytes());
-            msg_buf.push(0);
-            lua_pushstring(L, msg_buf.as_ptr() as *const c_char);
+            push_rust_string(L, &e);
             2
         }
     }
+}
+
+/// Push a SqlValue onto the Lua stack with correct typing.
+unsafe fn push_sql_value(L: *mut LuaState, val: &SqlValue) {
+    match val {
+        SqlValue::Null => lua_pushnil(L),
+        SqlValue::Integer(n) => lua_pushinteger(L, *n),
+        SqlValue::Real(n) => lua_pushnumber(L, *n),
+        SqlValue::Text(s) => {
+            lua_pushlstring(L, s.as_ptr() as *const c_char, s.len());
+        }
+    }
+}
+
+/// Push a Rust &str as a null-terminated Lua string.
+unsafe fn push_rust_string(L: *mut LuaState, s: &str) {
+    let mut buf = alloc::vec::Vec::with_capacity(s.len() + 1);
+    buf.extend_from_slice(s.as_bytes());
+    buf.push(0);
+    lua_pushstring(L, buf.as_ptr() as *const c_char);
 }
 
 // ============================================================
@@ -166,21 +166,14 @@ unsafe extern "C" fn lua_read(L: *mut LuaState) -> c_int {
         path.replace('\'', "''")
     );
 
-    match db.exec_with_results(&query) {
-        Ok(output) => {
-            let lines: alloc::vec::Vec<&str> = output.lines().collect();
-            if lines.len() >= 2 {
-                // Content may contain embedded newlines — join all lines after header
-                let content = lines[1..].join("\n");
-                lua_pushlstring(L, content.as_ptr() as *const c_char, content.len());
-            } else {
-                lua_pushnil(L);
-            }
+    match db.query_value(&query) {
+        Ok(Some(content)) => {
+            lua_pushlstring(L, content.as_ptr() as *const c_char, content.len());
             drop(guard);
             audit_log(L, "FILE_READ", path);
             1
         }
-        Err(_) => {
+        _ => {
             lua_pushnil(L);
             1
         }
@@ -214,8 +207,10 @@ unsafe extern "C" fn lua_write(L: *mut LuaState) -> c_int {
         None => { lua_pushboolean(L, 0); return 1; }
     };
 
+    // mtime = strftime('%s','now') via SQL expression
     let query = alloc::format!(
-        "INSERT OR REPLACE INTO namespace (path, type, content) VALUES ('{}', 'data', '{}')",
+        "INSERT OR REPLACE INTO namespace (path, type, content, mtime) \
+         VALUES ('{}', 'data', '{}', strftime('%s','now'))",
         path.replace('\'', "''"),
         data.replace('\'', "''")
     );
@@ -249,7 +244,8 @@ unsafe extern "C" fn lua_ls(L: *mut LuaState) -> c_int {
         }
     };
 
-    // List entries whose path starts with the given prefix
+    // List entries whose path starts with the given prefix.
+    // Use substr() instead of LIKE to avoid wildcard injection (%, _).
     let prefix = if path.ends_with('/') {
         alloc::string::String::from(path)
     } else {
@@ -257,17 +253,16 @@ unsafe extern "C" fn lua_ls(L: *mut LuaState) -> c_int {
     };
 
     let query = alloc::format!(
-        "SELECT path FROM namespace WHERE path LIKE '{}%' ORDER BY path",
+        "SELECT path FROM namespace WHERE substr(path, 1, {}) = '{}' ORDER BY path",
+        prefix.len(),
         prefix.replace('\'', "''")
     );
 
-    match db.exec_with_results(&query) {
-        Ok(output) => {
-            let lines: alloc::vec::Vec<&str> = output.lines().collect();
-            lua_createtable(L, (lines.len().saturating_sub(1)) as c_int, 0);
-
-            for (i, line) in lines[1..].iter().enumerate() {
-                lua_pushlstring(L, line.as_ptr() as *const c_char, line.len());
+    match db.query_column(&query) {
+        Ok(paths) => {
+            lua_createtable(L, paths.len() as c_int, 0);
+            for (i, p) in paths.iter().enumerate() {
+                lua_pushlstring(L, p.as_ptr() as *const c_char, p.len());
                 lua_rawseti(L, -2, (i + 1) as i64);
             }
             1

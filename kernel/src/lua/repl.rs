@@ -153,18 +153,21 @@ unsafe fn print_error(L: *mut LuaState) {
     lua_pop(L, 1);
 }
 
-/// exit() Lua function — signals the REPL to exit by raising an error.
-const EXIT_SENTINEL: &[u8] = b"__HEAVEN_EXIT__\0";
+/// Unique address used as lightuserdata sentinel for exit().
+/// Using a lightuserdata avoids collisions with user error strings.
+static EXIT_SENTINEL: u8 = 0;
 
+/// exit() Lua function — signals the REPL to exit by raising an error.
 unsafe extern "C" fn lua_exit(L: *mut LuaState) -> c_int {
-    lua_pushstring(L, EXIT_SENTINEL.as_ptr() as *const i8);
+    lua_pushlightuserdata(L, &EXIT_SENTINEL as *const u8 as *mut core::ffi::c_void);
     lua_error(L)
 }
 
-/// Check if the error on the stack is our exit sentinel.
+/// Check if the error on the stack is our exit sentinel (lightuserdata).
 unsafe fn check_exit_signal(L: *mut LuaState) -> bool {
-    match lua_to_str(L, -1) {
-        Some(bytes) => bytes == &EXIT_SENTINEL[..EXIT_SENTINEL.len() - 1],
-        None => false,
+    if lua_type(L, -1) != LUA_TLIGHTUSERDATA {
+        return false;
     }
+    let p = lua_touserdata(L, -1);
+    p == &EXIT_SENTINEL as *const u8 as *mut core::ffi::c_void
 }

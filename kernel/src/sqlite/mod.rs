@@ -15,7 +15,7 @@ use spin::Mutex;
 
 use crate::vfs::HeavenVfs;
 
-pub use ffi::SqliteDb;
+pub use ffi::{SqliteDb, SqlValue, QueryResult};
 
 /// Global SQLite database instance (opened once at boot).
 pub static DB: Mutex<Option<SqliteDb>> = Mutex::new(None);
@@ -57,10 +57,10 @@ pub fn init(vfs: &'static HeavenVfs) -> Result<(), String> {
     db.exec(
         "CREATE TABLE IF NOT EXISTS namespace (\
             path    TEXT PRIMARY KEY, \
-            type    TEXT NOT NULL CHECK(type IN ('data','lua','dir')), \
+            type    TEXT NOT NULL CHECK(type IN ('data','lua','dir','config','ctl','log')), \
             content BLOB, \
             mode    INTEGER DEFAULT 420, \
-            mtime   INTEGER DEFAULT 0\
+            mtime   INTEGER DEFAULT (strftime('%s','now'))\
         )",
     )?;
 
@@ -68,7 +68,7 @@ pub fn init(vfs: &'static HeavenVfs) -> Result<(), String> {
     db.exec(
         "CREATE TABLE IF NOT EXISTS audit (\
             id      INTEGER PRIMARY KEY AUTOINCREMENT, \
-            ts      TEXT DEFAULT (datetime('now')), \
+            ts      INTEGER DEFAULT (strftime('%s','now')), \
             level   TEXT DEFAULT 'INFO', \
             agent   TEXT, \
             action  TEXT, \
