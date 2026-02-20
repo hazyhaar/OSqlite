@@ -17,7 +17,12 @@ pub mod repl;
 use ::alloc::string::String;
 use ::alloc::vec::Vec;
 
+use core::ffi::c_void;
+
 use ffi::*;
+
+/// Default execution timeout for Lua agents (30 seconds).
+const EXEC_TIMEOUT_MS: u64 = 30_000;
 
 /// Run a Lua agent stored in the namespace table.
 ///
@@ -38,8 +43,10 @@ pub fn run_agent(path: &str) -> Result<(), String> {
 /// Execute a Lua source string.
 pub fn run_string(code: &str, name: &str) -> Result<(), String> {
     unsafe {
-        // 1. Create Lua state with our allocator
-        let L = lua_newstate(alloc::heaven_lua_alloc, core::ptr::null_mut());
+        // 1. Create Lua state with our allocator (memory-limited)
+        let mut alloc_state = alloc::LuaAllocState::new(alloc::LUA_MEM_LIMIT);
+        let ud = &mut alloc_state as *mut alloc::LuaAllocState as *mut core::ffi::c_void;
+        let L = lua_newstate(alloc::heaven_lua_alloc, ud);
         if L.is_null() {
             return Err(String::from("failed to create Lua state (out of memory)"));
         }
@@ -56,7 +63,13 @@ pub fn run_string(code: &str, name: &str) -> Result<(), String> {
         // 5. Store agent name in registry for audit logging
         store_agent_name(L, name);
 
-        // 6. Load and execute the script
+        // 6. Restrict SQL to read-only for agents (REPL has full access)
+        builtins::set_sql_readonly(L, true);
+
+        // 7. Install execution timeout hook (30 second limit for agents)
+        install_timeout_hook(L, EXEC_TIMEOUT_MS);
+
+        // 7. Load and execute the script
         let result = load_and_exec(L, code, name);
 
         // 7. Close state (frees all Lua memory)
@@ -81,14 +94,14 @@ fn load_script_from_db(path: &str) -> Result<String, String> {
 
     let result = db.exec_with_results(&query)?;
 
-    // exec_with_results returns "header\nrow1\n..." — skip the header line
+    // exec_with_results returns "header\nrow1\n..." — skip the header line.
+    // Content may contain embedded newlines, so join all lines after the header.
     let lines: Vec<&str> = result.lines().collect();
     if lines.len() < 2 {
         return Err(::alloc::format!("agent not found: {}", path));
     }
 
-    // The content is everything after the header line
-    Ok(String::from(lines[1]))
+    Ok(lines[1..].join("\n"))
 }
 
 /// Store the agent name in the Lua registry so builtins can read it for audit.
@@ -143,6 +156,39 @@ unsafe fn get_lua_error(L: *mut LuaState) -> String {
             lua_pop(L, 1);
             String::from("unknown Lua error")
         }
+    }
+}
+
+/// Install a Lua debug hook that aborts execution after a timeout.
+///
+/// The hook fires every 10000 instructions and checks elapsed time via TSC.
+/// The deadline (in TSC ticks) is stored in the Lua registry as a light userdata.
+unsafe fn install_timeout_hook(L: *mut LuaState, timeout_ms: u64) {
+    let per_ms = crate::arch::x86_64::timer::tsc_per_ms();
+    let start = crate::arch::x86_64::cpu::rdtsc();
+    let deadline = if per_ms > 0 {
+        start.saturating_add(timeout_ms.saturating_mul(per_ms))
+    } else {
+        u64::MAX // no TSC calibration — no timeout
+    };
+
+    // Store deadline in registry as light userdata (pointer-sized integer)
+    lua_pushinteger(L, deadline as i64);
+    lua_setfield(L, LUA_REGISTRYINDEX, b"_DEADLINE\0".as_ptr() as *const i8);
+
+    // Install count hook: fires every 10000 VM instructions
+    lua_sethook(L, Some(timeout_hook), LUA_MASKCOUNT, 10000);
+}
+
+/// Lua debug hook callback — checks if execution has exceeded deadline.
+unsafe extern "C" fn timeout_hook(L: *mut LuaState, _ar: *mut c_void) {
+    lua_getfield(L, LUA_REGISTRYINDEX, b"_DEADLINE\0".as_ptr() as *const i8);
+    let deadline = lua_tointegerx(L, -1, core::ptr::null_mut()) as u64;
+    lua_pop(L, 1);
+
+    let now = crate::arch::x86_64::cpu::rdtsc();
+    if now >= deadline {
+        luaL_error(L, b"execution timeout exceeded\0".as_ptr() as *const i8);
     }
 }
 

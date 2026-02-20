@@ -266,7 +266,10 @@ fn cmd_cat(path: &str) {
             Ok(output) => {
                 let lines: alloc::vec::Vec<&str> = output.lines().collect();
                 if lines.len() >= 2 {
-                    serial_println!("{}", lines[1]);
+                    // Content may contain embedded newlines — print all lines after header
+                    for line in &lines[1..] {
+                        serial_println!("{}", line);
+                    }
                     return;
                 }
             }

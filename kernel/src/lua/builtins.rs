@@ -45,6 +45,24 @@ unsafe extern "C" fn lua_sql(L: *mut LuaState) -> c_int {
         }
     };
 
+    // Block dangerous SQL from agents (not REPL).
+    // Check registry flag _SQL_READONLY; if set, only allow SELECT/EXPLAIN/PRAGMA.
+    let restricted = is_sql_restricted(L);
+    if restricted {
+        let upper = query.trim_start();
+        let allowed = upper.starts_with("SELECT")
+            || upper.starts_with("select")
+            || upper.starts_with("EXPLAIN")
+            || upper.starts_with("explain")
+            || upper.starts_with("PRAGMA")
+            || upper.starts_with("pragma");
+        if !allowed {
+            lua_pushnil(L);
+            lua_pushstring(L, b"sql() is read-only for agents\0".as_ptr() as _);
+            return 2;
+        }
+    }
+
     // Use the SQLite database
     let guard = crate::sqlite::DB.lock();
     let db = match guard.as_ref() {
@@ -152,7 +170,8 @@ unsafe extern "C" fn lua_read(L: *mut LuaState) -> c_int {
         Ok(output) => {
             let lines: alloc::vec::Vec<&str> = output.lines().collect();
             if lines.len() >= 2 {
-                let content = lines[1];
+                // Content may contain embedded newlines — join all lines after header
+                let content = lines[1..].join("\n");
                 lua_pushlstring(L, content.as_ptr() as *const c_char, content.len());
             } else {
                 lua_pushnil(L);
@@ -308,10 +327,13 @@ fn type_name(t: c_int) -> &'static str {
 // sleep(ms) — busy-wait using TSC
 // ============================================================
 
+const MAX_SLEEP_MS: i64 = 60_000; // 60 seconds max
+
 unsafe extern "C" fn lua_sleep(L: *mut LuaState) -> c_int {
     let ms = lua_tointegerx(L, 1, core::ptr::null_mut());
     if ms > 0 {
-        crate::arch::x86_64::timer::delay_us(ms as u64 * 1000);
+        let clamped = if ms > MAX_SLEEP_MS { MAX_SLEEP_MS } else { ms };
+        crate::arch::x86_64::timer::delay_us(clamped as u64 * 1000);
     }
     0
 }
@@ -365,6 +387,20 @@ unsafe extern "C" fn lua_audit(L: *mut LuaState) -> c_int {
 // ============================================================
 // Internal helpers
 // ============================================================
+
+/// Check if SQL is restricted to read-only for this Lua state.
+unsafe fn is_sql_restricted(L: *mut LuaState) -> bool {
+    lua_getfield(L, LUA_REGISTRYINDEX, b"_SQL_READONLY\0".as_ptr() as *const c_char);
+    let restricted = lua_toboolean(L, -1) != 0;
+    lua_pop(L, 1);
+    restricted
+}
+
+/// Mark this Lua state as SQL-restricted (read-only).
+pub unsafe fn set_sql_readonly(L: *mut LuaState, readonly: bool) {
+    lua_pushboolean(L, readonly as core::ffi::c_int);
+    lua_setfield(L, LUA_REGISTRYINDEX, b"_SQL_READONLY\0".as_ptr() as *const c_char);
+}
 
 /// Get the agent name from the Lua registry.
 unsafe fn get_agent_name(L: *mut LuaState) -> alloc::string::String {

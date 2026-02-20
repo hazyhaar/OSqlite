@@ -140,8 +140,11 @@ clock_t clock(void) {
 typedef long time_t;
 time_t time(time_t *t);  /* already in heaven_stubs.c */
 
-/* ===== abs — used by lcode.c ===== */
-int abs(int x) { return x < 0 ? -x : x; }
+/* ===== abs — used by lcode.c (guard against INT_MIN UB) ===== */
+int abs(int x) {
+    if (x == (-2147483647 - 1)) return 2147483647;
+    return x < 0 ? -x : x;
+}
 
 /* ===== strpbrk — used by lobject.c, lstrlib.c ===== */
 char *strpbrk(const char *s, const char *accept) {
@@ -423,6 +426,15 @@ double acos(double x) {
     return 1.57079632679489662 - asin(x);
 }
 
-/* fmin/fmax — Lua 5.4 math library uses these */
-double fmin(double a, double b) { return a < b ? a : b; }
-double fmax(double a, double b) { return a > b ? a : b; }
+/* fmin/fmax — Lua 5.4 math library uses these (NaN-correct per C99) */
+int isnan(double);  /* from heaven_stubs.c */
+double fmin(double a, double b) {
+    if (isnan(a)) return b;
+    if (isnan(b)) return a;
+    return a < b ? a : b;
+}
+double fmax(double a, double b) {
+    if (isnan(a)) return b;
+    if (isnan(b)) return a;
+    return a > b ? a : b;
+}

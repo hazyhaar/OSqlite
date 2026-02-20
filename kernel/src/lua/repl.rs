@@ -16,7 +16,10 @@ pub fn run() {
     serial_println!("Type ^D to exit.");
 
     unsafe {
-        let L = lua_newstate(heaven_lua_alloc, core::ptr::null_mut());
+        // REPL gets a larger limit (4 MiB) for interactive use
+        let mut alloc_state = super::alloc::LuaAllocState::new(4 * super::alloc::LUA_MEM_LIMIT);
+        let ud = &mut alloc_state as *mut super::alloc::LuaAllocState as *mut core::ffi::c_void;
+        let L = lua_newstate(heaven_lua_alloc, ud);
         if L.is_null() {
             serial_println!("[lua] ERROR: failed to create Lua state (out of memory)");
             return;

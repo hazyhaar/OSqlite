@@ -63,6 +63,17 @@ extern "C" {
 
     // === Errors ===
     pub fn lua_error(L: *mut LuaState) -> c_int;
+
+    // === Debug hooks (for execution timeout) ===
+    pub fn lua_sethook(
+        L: *mut LuaState,
+        f: Option<unsafe extern "C" fn(*mut LuaState, *mut c_void)>,
+        mask: c_int,
+        count: c_int,
+    ) -> c_int;
+
+    // === Auxiliary ===
+    pub fn luaL_error(L: *mut LuaState, fmt: *const c_char, ...) -> c_int;
 }
 
 // === Constants ===
@@ -80,6 +91,9 @@ pub const LUA_MULTRET: c_int = -1;
 pub const LUA_REGISTRYINDEX: c_int = -1001000;
 
 pub const LUA_GCINC: c_int = 9;
+
+// Debug hook masks
+pub const LUA_MASKCOUNT: c_int = 1 << 3;
 
 // === Inline helpers ===
 
