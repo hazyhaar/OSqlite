@@ -71,6 +71,13 @@ impl LineEditor {
                     return None;
                 }
 
+                // Ctrl-D — EOF (only when line is empty, like a real terminal)
+                0x04 => {
+                    if self.len == 0 {
+                        return None;
+                    }
+                }
+
                 // Ctrl-U — clear line
                 0x15 => {
                     self.erase_line();

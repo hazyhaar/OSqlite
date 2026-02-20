@@ -83,6 +83,27 @@ pub fn dispatch(line: &str) {
                 cmd_sql(&rest);
             }
         }
+        "run" => {
+            if let Some(path) = parts.next() {
+                cmd_run(path);
+            } else {
+                serial_println!("usage: run <path>   (execute a Lua agent from namespace)");
+            }
+        }
+        "store" => {
+            // store <path> <code...>
+            if let Some(path) = parts.next() {
+                let code: alloc::string::String = parts.collect::<alloc::vec::Vec<&str>>().join(" ");
+                if code.is_empty() {
+                    serial_println!("usage: store <path> <lua code>");
+                } else {
+                    cmd_store(path, &code);
+                }
+            } else {
+                serial_println!("usage: store <path> <lua code>");
+            }
+        }
+        "lua" => cmd_lua_repl(),
         "clear" => cmd_clear(),
         "panic" => cmd_panic(),
         "reboot" => cmd_reboot(),
@@ -106,6 +127,11 @@ fn cmd_help() {
     serial_println!("  cat <path>    read a namespace file");
     serial_println!("  echo <text>   print text");
     serial_println!("  sql <stmt>    execute SQL on the system database");
+    serial_println!();
+    serial_println!("Lua:");
+    serial_println!("  lua             interactive Lua REPL");
+    serial_println!("  run <path>      execute a Lua agent from namespace");
+    serial_println!("  store <p> <c>   store Lua script at path");
     serial_println!();
     serial_println!("Claude API:");
     serial_println!("  apikey <key>     set Anthropic API key");
@@ -212,20 +238,43 @@ fn cmd_ls(path: &str) {
 }
 
 fn cmd_cat(path: &str) {
-    // Map well-known paths to synthetic content.
-    // When the Styx server is wired in, this will Tread the file.
+    // Map well-known paths to synthetic content
     match path {
-        "/sys/meminfo" | "sys/meminfo" => cmd_meminfo(),
-        "/sys/uptime" | "sys/uptime" => cmd_uptime(),
-        "/hw/nvme/info" | "hw/nvme/info" => cmd_nvme_info(),
+        "/sys/meminfo" | "sys/meminfo" => { cmd_meminfo(); return; }
+        "/sys/uptime" | "sys/uptime" => { cmd_uptime(); return; }
+        "/hw/nvme/info" | "hw/nvme/info" => { cmd_nvme_info(); return; }
         "/db/schema" | "db/schema" => {
-            serial_println!("-- schema placeholder");
-            serial_println!("-- (SQLite not yet integrated)");
+            match crate::sqlite::exec_and_format(
+                "SELECT sql FROM sqlite_master WHERE type='table' ORDER BY name"
+            ) {
+                Ok(out) => serial_print!("{}", out),
+                Err(e) => serial_println!("error: {}", e),
+            }
+            return;
         }
-        _ => {
-            serial_println!("cat: {}: not found", path);
+        _ => {}
+    }
+
+    // Try reading from the namespace table
+    let guard = crate::sqlite::DB.lock();
+    if let Some(db) = guard.as_ref() {
+        let query = alloc::format!(
+            "SELECT content FROM namespace WHERE path='{}'",
+            path.replace('\'', "''")
+        );
+        match db.exec_with_results(&query) {
+            Ok(output) => {
+                let lines: alloc::vec::Vec<&str> = output.lines().collect();
+                if lines.len() >= 2 {
+                    serial_println!("{}", lines[1]);
+                    return;
+                }
+            }
+            Err(_) => {}
         }
     }
+    drop(guard);
+    serial_println!("cat: {}: not found", path);
 }
 
 fn cmd_clear() {
@@ -400,4 +449,38 @@ fn cmd_reboot() {
     loop {
         unsafe { core::arch::asm!("hlt"); }
     }
+}
+
+fn cmd_run(path: &str) {
+    serial_println!("[lua] running agent: {}", path);
+    match crate::lua::run_agent(path) {
+        Ok(()) => serial_println!("[lua] agent finished."),
+        Err(e) => serial_println!("[lua] error: {}", e),
+    }
+}
+
+fn cmd_store(path: &str, code: &str) {
+    let guard = crate::sqlite::DB.lock();
+    let db = match guard.as_ref() {
+        Some(db) => db,
+        None => {
+            serial_println!("error: database not open");
+            return;
+        }
+    };
+
+    let query = alloc::format!(
+        "INSERT OR REPLACE INTO namespace (path, type, content) VALUES ('{}', 'lua', '{}')",
+        path.replace('\'', "''"),
+        code.replace('\'', "''")
+    );
+
+    match db.exec(&query) {
+        Ok(()) => serial_println!("stored: {} ({} bytes)", path, code.len()),
+        Err(e) => serial_println!("error: {}", e),
+    }
+}
+
+fn cmd_lua_repl() {
+    crate::lua::repl::run();
 }
