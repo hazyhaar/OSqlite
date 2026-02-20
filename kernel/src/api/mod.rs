@@ -112,6 +112,12 @@ where
 }
 
 /// TLS path — direct HTTPS using embedded-tls.
+///
+/// SECURITY WARNING: Certificate verification is NOT available in no_std
+/// environments with embedded-tls. The `UnsecureProvider` skips all
+/// certificate validation. A network MITM can intercept the API key and
+/// all request/response data. Only use this over trusted networks
+/// (e.g., QEMU NAT to localhost). See AUDIT.md finding #1.
 fn claude_request_tls<F>(
     net: &mut NetStack,
     config: &ClaudeConfig,
@@ -126,6 +132,12 @@ where
     use embedded_tls::blocking::TlsConnection;
     use embedded_tls::{Aes128GcmSha256, TlsConfig, TlsContext, UnsecureProvider};
 
+    // SECURITY: Log a warning every time we use unverified TLS
+    crate::serial_println!(
+        "[SECURITY WARNING] TLS connection without certificate verification — \
+         API key may be exposed to MITM attacks"
+    );
+
     // 1. TCP connect + wait for established
     let handle = net.tcp_connect(config.target_ip, config.target_port)
         .ok_or(ApiError::ConnectionFailed)?;
@@ -139,7 +151,12 @@ where
     // 2. Wrap in embedded-io adapter
     let tcp = TcpStream::new(net, handle);
 
-    // 3. TLS handshake (no certificate verification — UnsecureProvider)
+    // 3. TLS handshake
+    // NOTE: embedded-tls requires the `webpki` + `std` features for
+    // certificate verification (CertVerifier). In no_std bare-metal, only
+    // UnsecureProvider is available. When embedded-tls adds no_std cert
+    // verification, replace UnsecureProvider with a pinning verifier that
+    // checks the SHA-256 fingerprint of api.anthropic.com's certificate.
     let mut read_buf = vec![0u8; 16640];
     let mut write_buf = vec![0u8; 16640];
 

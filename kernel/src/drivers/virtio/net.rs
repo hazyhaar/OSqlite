@@ -252,47 +252,62 @@ impl VirtioNet {
     }
 }
 
+/// Check if a PCI device is multi-function (Header Type bit 7).
+fn is_multi_function(bus: u8, device: u8) -> bool {
+    let header_type = pci_read32(bus, device, 0, 0x0C);
+    ((header_type >> 16) & 0x80) != 0
+}
+
 /// Scan PCI for a legacy virtio-net device.
 /// Legacy virtio: vendor 0x1AF4, device 0x1000, subsystem ID 1 (network).
+/// Checks all functions (0..7) on multi-function devices.
 pub fn find_virtio_net() -> Option<VirtioNetPciInfo> {
     for bus in 0..=255u16 {
         for device in 0..32u8 {
             let vendor_device = pci_read32(bus as u8, device, 0, 0x00);
             let vendor_id = (vendor_device & 0xFFFF) as u16;
 
-            if vendor_id != 0x1AF4 {
+            if vendor_id == 0xFFFF {
                 continue;
             }
 
-            let device_id = ((vendor_device >> 16) & 0xFFFF) as u16;
+            let max_func = if is_multi_function(bus as u8, device) { 8 } else { 1 };
 
-            // Only accept legacy virtio (device ID 0x1000)
-            if device_id != 0x1000 {
-                continue;
+            for func in 0..max_func {
+                let vd = if func == 0 { vendor_device } else {
+                    let vd = pci_read32(bus as u8, device, func, 0x00);
+                    if (vd & 0xFFFF) as u16 == 0xFFFF { continue; }
+                    vd
+                };
+                let vid = (vd & 0xFFFF) as u16;
+                let did = ((vd >> 16) & 0xFFFF) as u16;
+
+                if vid != 0x1AF4 || did != 0x1000 {
+                    continue;
+                }
+
+                // Check subsystem ID to confirm it's a network device (subsys 1)
+                let subsys = pci_read32(bus as u8, device, func, 0x2C);
+                let subsys_id = ((subsys >> 16) & 0xFFFF) as u16;
+                if subsys_id != 1 {
+                    continue;
+                }
+
+                // Enable bus mastering + I/O space access
+                let cmd = pci_read32(bus as u8, device, func, 0x04);
+                pci_write32(bus as u8, device, func, 0x04, cmd | 0x05);
+
+                // Read BAR0 — for legacy virtio this is an I/O port BAR
+                let bar0_raw = pci_read32(bus as u8, device, func, 0x10);
+                let iobase = (bar0_raw & !0x3) as u16;
+
+                return Some(VirtioNetPciInfo {
+                    bus: bus as u8,
+                    device,
+                    device_id: did,
+                    iobase,
+                });
             }
-
-            // Check subsystem ID to confirm it's a network device (subsys 1)
-            let subsys = pci_read32(bus as u8, device, 0, 0x2C);
-            let subsys_id = ((subsys >> 16) & 0xFFFF) as u16;
-            if subsys_id != 1 {
-                continue;
-            }
-
-            // Enable bus mastering + I/O space access
-            let cmd = pci_read32(bus as u8, device, 0, 0x04);
-            pci_write32(bus as u8, device, 0, 0x04, cmd | 0x05); // bit 0 = I/O, bit 2 = bus master
-
-            // Read BAR0 — for legacy virtio this is an I/O port BAR
-            let bar0_raw = pci_read32(bus as u8, device, 0, 0x10);
-            // Bit 0 = 1 means I/O space (as expected for legacy virtio)
-            let iobase = (bar0_raw & !0x3) as u16;
-
-            return Some(VirtioNetPciInfo {
-                bus: bus as u8,
-                device,
-                device_id,
-                iobase,
-            });
         }
     }
     None

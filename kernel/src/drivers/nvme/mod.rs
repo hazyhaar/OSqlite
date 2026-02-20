@@ -12,6 +12,27 @@ use spin::Mutex;
 use crate::mem::DmaBuf;
 use queue::{QueuePair, AdminQueue};
 
+/// Default I/O command timeout in milliseconds (30 seconds).
+const IO_TIMEOUT_MS: u64 = 30_000;
+
+/// Spin-wait for a completion with a TSC-based timeout.
+/// Returns `Some(status)` if the completion arrived, `None` on timeout.
+fn poll_with_timeout<F: FnMut() -> Option<u16>>(mut poll_fn: F, timeout_ms: u64) -> Option<u16> {
+    let per_ms = crate::arch::x86_64::timer::tsc_per_ms();
+    let start = crate::arch::x86_64::cpu::rdtsc();
+    let deadline = if per_ms > 0 { timeout_ms.saturating_mul(per_ms) } else { u64::MAX };
+    loop {
+        if let Some(status) = poll_fn() {
+            return Some(status);
+        }
+        let elapsed = crate::arch::x86_64::cpu::rdtsc().wrapping_sub(start);
+        if elapsed >= deadline {
+            return None;
+        }
+        core::hint::spin_loop();
+    }
+}
+
 /// NVMe controller BAR0 register offsets.
 mod regs {
     pub const CAP: usize = 0x00;       // Controller Capabilities
@@ -205,13 +226,13 @@ impl NvmeDriver {
         compiler_fence(Ordering::SeqCst);
         self.ring_admin_sq_doorbell();
 
-        // Spin-wait for completion
-        loop {
-            if let Some(status) = self.admin_queue.poll_completion() {
+        let aq = &mut self.admin_queue;
+        match poll_with_timeout(|| aq.poll_completion(), IO_TIMEOUT_MS) {
+            Some(status) => {
                 self.ring_admin_cq_doorbell();
-                return Ok(status);
+                Ok(status)
             }
-            core::hint::spin_loop();
+            None => Err(NvmeError::Timeout),
         }
     }
 
@@ -223,12 +244,13 @@ impl NvmeDriver {
         compiler_fence(Ordering::SeqCst);
         self.ring_admin_sq_doorbell();
 
-        loop {
-            if let Some(status) = self.admin_queue.poll_completion() {
+        let aq = &mut self.admin_queue;
+        match poll_with_timeout(|| aq.poll_completion(), IO_TIMEOUT_MS) {
+            Some(status) => {
                 self.ring_admin_cq_doorbell();
-                return Ok(status);
+                Ok(status)
             }
-            core::hint::spin_loop();
+            None => Err(NvmeError::Timeout),
         }
     }
 
@@ -264,18 +286,17 @@ impl NvmeDriver {
         let sq_tail = qp.sq_tail();
         unsafe { Self::write_doorbell(bar0, regs::SQ0TDBL + (2 * qid) * stride, sq_tail as u32) };
 
-        loop {
-            if let Some(status) = qp.poll_completion() {
+        match poll_with_timeout(|| qp.poll_completion(), IO_TIMEOUT_MS) {
+            Some(status) => {
                 let cq_head = qp.cq_head();
                 unsafe { Self::write_doorbell(bar0, regs::SQ0TDBL + (2 * qid + 1) * stride, cq_head as u32) };
-                // _prp_list dropped here after command completes
                 if status != 0 {
                     return Err(NvmeError::CommandFailed(status));
                 }
                 buf.invalidate_cache();
-                return Ok(());
+                Ok(())
             }
-            core::hint::spin_loop();
+            None => Err(NvmeError::Timeout),
         }
     }
 
@@ -303,17 +324,16 @@ impl NvmeDriver {
         let sq_tail = qp.sq_tail();
         unsafe { Self::write_doorbell(bar0, regs::SQ0TDBL + (2 * qid) * stride, sq_tail as u32) };
 
-        loop {
-            if let Some(status) = qp.poll_completion() {
+        match poll_with_timeout(|| qp.poll_completion(), IO_TIMEOUT_MS) {
+            Some(status) => {
                 let cq_head = qp.cq_head();
                 unsafe { Self::write_doorbell(bar0, regs::SQ0TDBL + (2 * qid + 1) * stride, cq_head as u32) };
-                // _prp_list dropped here after command completes
                 if status != 0 {
                     return Err(NvmeError::CommandFailed(status));
                 }
-                return Ok(());
+                Ok(())
             }
-            core::hint::spin_loop();
+            None => Err(NvmeError::Timeout),
         }
     }
 
@@ -333,16 +353,16 @@ impl NvmeDriver {
         let sq_tail = qp.sq_tail();
         unsafe { Self::write_doorbell(bar0, regs::SQ0TDBL + (2 * qid) * stride, sq_tail as u32) };
 
-        loop {
-            if let Some(status) = qp.poll_completion() {
+        match poll_with_timeout(|| qp.poll_completion(), IO_TIMEOUT_MS) {
+            Some(status) => {
                 let cq_head = qp.cq_head();
                 unsafe { Self::write_doorbell(bar0, regs::SQ0TDBL + (2 * qid + 1) * stride, cq_head as u32) };
                 if status != 0 {
                     return Err(NvmeError::CommandFailed(status));
                 }
-                return Ok(());
+                Ok(())
             }
-            core::hint::spin_loop();
+            None => Err(NvmeError::Timeout),
         }
     }
 
