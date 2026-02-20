@@ -10,6 +10,7 @@
 ///   on the QEMU host that terminates TLS. Fallback for debugging.
 pub mod http;
 pub mod json;
+pub mod tools;
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -33,9 +34,78 @@ const BASE_DELAY_MS: u64 = 1000;
 // ---- Types ----
 
 /// A single message in a conversation.
+/// For simple text messages, `content` holds the text.
+/// For tool_result messages, use `ContentBlock::ToolResult` via `content_blocks`.
 pub struct Message {
     pub role: &'static str, // "user" | "assistant"
     pub content: String,
+    /// Structured content blocks (used for tool_result and mixed responses).
+    /// If non-empty, these are serialized instead of `content`.
+    pub content_blocks: Vec<ContentBlock>,
+}
+
+impl Message {
+    /// Create a simple text message.
+    pub fn text(role: &'static str, content: String) -> Self {
+        Self { role, content, content_blocks: Vec::new() }
+    }
+
+    /// Create a tool_result message.
+    pub fn tool_result(tool_use_id: String, result: String, is_error: bool) -> Self {
+        Self {
+            role: "user",
+            content: String::new(),
+            content_blocks: vec![ContentBlock::ToolResult {
+                tool_use_id,
+                content: result,
+                is_error,
+            }],
+        }
+    }
+
+    /// Create an assistant message with tool_use blocks (for conversation history).
+    pub fn assistant_tool_use(text: String, tool_calls: Vec<ToolCall>) -> Self {
+        let mut blocks = Vec::new();
+        if !text.is_empty() {
+            blocks.push(ContentBlock::Text(text));
+        }
+        for tc in tool_calls {
+            blocks.push(ContentBlock::ToolUse {
+                id: tc.id,
+                name: tc.name,
+                input_json: tc.input_json,
+            });
+        }
+        Self {
+            role: "assistant",
+            content: String::new(),
+            content_blocks: blocks,
+        }
+    }
+}
+
+/// A content block in a message — text, tool_use, or tool_result.
+#[derive(Clone)]
+pub enum ContentBlock {
+    Text(String),
+    ToolUse { id: String, name: String, input_json: String },
+    ToolResult { tool_use_id: String, content: String, is_error: bool },
+}
+
+/// A tool call extracted from Claude's response.
+#[derive(Clone)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub input_json: String,
+}
+
+/// Result of a Claude API request — may contain text and/or tool calls.
+pub struct ClaudeResponse {
+    pub text: String,
+    pub tool_calls: Vec<ToolCall>,
+    /// "end_turn" or "tool_use" — indicates why the model stopped.
+    pub stop_reason: String,
 }
 
 /// Full request parameters for the Claude API.
@@ -43,6 +113,8 @@ pub struct ClaudeRequest {
     pub config: ClaudeConfig,
     pub system: Option<String>,
     pub messages: Vec<Message>,
+    /// Whether to include tool definitions in the request.
+    pub use_tools: bool,
 }
 
 /// Claude API configuration.
@@ -88,11 +160,8 @@ impl ClaudeConfig {
 
 /// Build the HTTP request for a single-turn prompt (backward compat).
 fn build_http_request(config: &ClaudeConfig, prompt: &str) -> Result<String, ApiError> {
-    let messages = vec![Message {
-        role: "user",
-        content: String::from(prompt),
-    }];
-    build_http_request_multi(config, None, &messages)
+    let messages = vec![Message::text("user", String::from(prompt))];
+    build_http_request_multi(config, None, &messages, false)
 }
 
 /// Build the HTTP request for a multi-turn conversation with optional system prompt.
@@ -100,6 +169,7 @@ fn build_http_request_multi(
     config: &ClaudeConfig,
     system: Option<&str>,
     messages: &[Message],
+    use_tools: bool,
 ) -> Result<String, ApiError> {
     // Validate inputs — reject CRLF to prevent header injection
     if config.model.contains('\r') || config.model.contains('\n') {
@@ -115,27 +185,78 @@ fn build_http_request_multi(
         if i > 0 {
             msgs_json.push(',');
         }
-        msgs_json.push_str(&format!(
-            r#"{{"role":"{}","content":"{}"}}"#,
-            escape_json(msg.role),
-            escape_json(&msg.content),
-        ));
+        if msg.content_blocks.is_empty() {
+            // Simple text message
+            msgs_json.push_str(&format!(
+                r#"{{"role":"{}","content":"{}"}}"#,
+                escape_json(msg.role),
+                escape_json(&msg.content),
+            ));
+        } else {
+            // Structured content blocks
+            msgs_json.push_str(&format!(r#"{{"role":"{}","content":["#, escape_json(msg.role)));
+            for (j, block) in msg.content_blocks.iter().enumerate() {
+                if j > 0 {
+                    msgs_json.push(',');
+                }
+                match block {
+                    ContentBlock::Text(text) => {
+                        msgs_json.push_str(&format!(
+                            r#"{{"type":"text","text":"{}"}}"#,
+                            escape_json(text),
+                        ));
+                    }
+                    ContentBlock::ToolUse { id, name, input_json } => {
+                        msgs_json.push_str(&format!(
+                            r#"{{"type":"tool_use","id":"{}","name":"{}","input":{}}}"#,
+                            escape_json(id),
+                            escape_json(name),
+                            input_json,
+                        ));
+                    }
+                    ContentBlock::ToolResult { tool_use_id, content, is_error } => {
+                        if *is_error {
+                            msgs_json.push_str(&format!(
+                                r#"{{"type":"tool_result","tool_use_id":"{}","is_error":true,"content":"{}"}}"#,
+                                escape_json(tool_use_id),
+                                escape_json(content),
+                            ));
+                        } else {
+                            msgs_json.push_str(&format!(
+                                r#"{{"type":"tool_result","tool_use_id":"{}","content":"{}"}}"#,
+                                escape_json(tool_use_id),
+                                escape_json(content),
+                            ));
+                        }
+                    }
+                }
+            }
+            msgs_json.push_str("]}");
+        }
     }
     msgs_json.push(']');
 
     // Build body
+    let tools_part = if use_tools {
+        format!(r#","tools":{}"#, tools::tools_json())
+    } else {
+        String::new()
+    };
+
     let body = if let Some(sys) = system {
         format!(
-            r#"{{"model":"{}","max_tokens":1024,"stream":true,"system":"{}","messages":{}}}"#,
+            r#"{{"model":"{}","max_tokens":4096,"stream":true,"system":"{}","messages":{}{}}}"#,
             escape_json(&config.model),
             escape_json(sys),
             msgs_json,
+            tools_part,
         )
     } else {
         format!(
-            r#"{{"model":"{}","max_tokens":1024,"stream":true,"messages":{}}}"#,
+            r#"{{"model":"{}","max_tokens":4096,"stream":true,"messages":{}{}}}"#,
             escape_json(&config.model),
             msgs_json,
+            tools_part,
         )
     };
 
@@ -175,7 +296,7 @@ where
     claude_send_with_retry(net, config, &request, on_token)
 }
 
-/// Send a multi-turn request to Claude.
+/// Send a multi-turn request to Claude (text-only response).
 pub fn claude_request_multi<F>(
     net: &mut NetStack,
     request: &ClaudeRequest,
@@ -188,8 +309,27 @@ where
         &request.config,
         request.system.as_deref(),
         &request.messages,
+        request.use_tools,
     )?;
     claude_send_with_retry(net, &request.config, &http_req, on_token)
+}
+
+/// Send an agentic request to Claude — returns full response with tool calls.
+pub fn claude_request_agentic<F>(
+    net: &mut NetStack,
+    request: &ClaudeRequest,
+    on_token: F,
+) -> Result<ClaudeResponse, ApiError>
+where
+    F: Fn(&str),
+{
+    let http_req = build_http_request_multi(
+        &request.config,
+        request.system.as_deref(),
+        &request.messages,
+        request.use_tools,
+    )?;
+    claude_send_agentic(net, &request.config, &http_req, on_token)
 }
 
 /// Send a request with retry logic.
@@ -242,6 +382,252 @@ where
     }
 
     Err(last_err)
+}
+
+/// Agentic send — parses both text and tool_use blocks from SSE stream.
+/// Currently TLS-only (agentic loop always uses direct HTTPS).
+fn claude_send_agentic<F>(
+    net: &mut NetStack,
+    config: &ClaudeConfig,
+    request: &str,
+    on_token: F,
+) -> Result<ClaudeResponse, ApiError>
+where
+    F: Fn(&str),
+{
+    let mut last_err = ApiError::EmptyResponse;
+
+    for attempt in 0..=MAX_RETRIES {
+        if attempt > 0 {
+            let delay_ms = BASE_DELAY_MS * (1u64 << (attempt - 1).min(4));
+            crate::serial_println!("[API] Retry {}/{} after {}ms...", attempt, MAX_RETRIES, delay_ms);
+            crate::arch::x86_64::timer::delay_us(delay_ms * 1000);
+        }
+
+        let result = claude_request_tls_agentic(net, config, request, &on_token);
+
+        match result {
+            Ok(response) => return Ok(response),
+            Err(ApiError::HttpStatus(status, ref msg, retry_after)) => {
+                if status == 429 || status == 500 || status == 529 {
+                    if let Some(secs) = retry_after {
+                        let wait_ms = (secs * 1000).min(60_000);
+                        crate::serial_println!("[API] Retry-After: {}s", secs);
+                        crate::arch::x86_64::timer::delay_us(wait_ms * 1000);
+                    }
+                    last_err = ApiError::HttpStatus(status, msg.clone(), retry_after);
+                    continue;
+                }
+                return Err(ApiError::HttpStatus(status, msg.clone(), retry_after));
+            }
+            Err(ApiError::ConnectionTimeout) | Err(ApiError::ConnectionFailed) => {
+                last_err = ApiError::ConnectionTimeout;
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(last_err)
+}
+
+/// TLS agentic request — returns ClaudeResponse with text + tool calls.
+fn claude_request_tls_agentic<F>(
+    net: &mut NetStack,
+    config: &ClaudeConfig,
+    request: &str,
+    on_token: &F,
+) -> Result<ClaudeResponse, ApiError>
+where
+    F: Fn(&str),
+{
+    use crate::crypto::RdRandRng;
+    use crate::net::tls::TcpStream;
+    use embedded_tls::blocking::TlsConnection;
+    use embedded_tls::{TlsConfig, TlsContext};
+
+    let handle = net.tcp_connect(config.target_ip, config.target_port)
+        .ok_or(ApiError::ConnectionFailed)?;
+
+    let connected = net.poll_until(|n| n.tcp_can_send(handle), 10_000);
+    if !connected {
+        net.tcp_close(handle);
+        return Err(ApiError::ConnectionTimeout);
+    }
+
+    let tcp = TcpStream::new(net, handle);
+
+    let mut read_buf = vec![0u8; 16640];
+    let mut write_buf = vec![0u8; 16640];
+
+    let tls_config = TlsConfig::new()
+        .with_server_name("api.anthropic.com")
+        .enable_rsa_signatures();
+
+    let mut tls = TlsConnection::new(tcp, &mut read_buf, &mut write_buf);
+    let rng = RdRandRng::new();
+
+    {
+        use embedded_tls::{Aes128GcmSha256, UnsecureProvider};
+        tls.open(TlsContext::new(
+            &tls_config,
+            UnsecureProvider::new::<Aes128GcmSha256>(rng),
+        )).map_err(|e| {
+            crate::serial_println!("[TLS] Handshake failed: {:?}", e);
+            ApiError::TlsHandshakeFailed
+        })?;
+    }
+
+    // Send request
+    let request_bytes = request.as_bytes();
+    let mut sent = 0;
+    while sent < request_bytes.len() {
+        let n = tls.write(&request_bytes[sent..]).map_err(|_| ApiError::SendFailed)?;
+        sent += n;
+    }
+    tls.flush().map_err(|_| ApiError::SendFailed)?;
+
+    // Parse SSE stream with tool_use support
+    let mut text_response = String::new();
+    let mut tool_calls: Vec<ToolCall> = Vec::new();
+    let mut stop_reason = String::from("end_turn");
+
+    // State for accumulating tool_use blocks
+    let mut current_tool_id = String::new();
+    let mut current_tool_name = String::new();
+    let mut current_tool_input = String::new();
+
+    let mut raw_buf = Vec::new();
+    let mut recv_buf = [0u8; 4096];
+    let mut headers_parsed = false;
+
+    loop {
+        match tls.read(&mut recv_buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                raw_buf.extend_from_slice(&recv_buf[..n]);
+
+                if !headers_parsed {
+                    if let Ok(resp) = http::HttpResponse::parse(&raw_buf) {
+                        headers_parsed = true;
+                        if let Some(err_msg) = resp.error_message() {
+                            let retry = resp.retry_after_secs();
+                            let _ = tls.close();
+                            return Err(ApiError::HttpStatus(resp.status, String::from(err_msg), retry));
+                        }
+                        raw_buf = raw_buf[resp.body_start..].to_vec();
+                    }
+                }
+
+                if headers_parsed {
+                    while let Some(event_end) = find_sse_event_end(&raw_buf) {
+                        let event_bytes = raw_buf[..event_end].to_vec();
+                        raw_buf = raw_buf[event_end..].to_vec();
+
+                        let event_str = match core::str::from_utf8(&event_bytes) {
+                            Ok(s) => s,
+                            Err(_) => continue,
+                        };
+
+                        let data = match extract_sse_data(event_str) {
+                            Some(d) => d,
+                            None => continue,
+                        };
+
+                        // Parse the SSE data JSON
+                        if let Ok(parsed) = json::parse(data) {
+                            let event_type = parsed.get("type")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+
+                            match event_type {
+                                "content_block_start" => {
+                                    // Check if this is a tool_use block
+                                    if let Some(cb) = parsed.get("content_block") {
+                                        let cb_type = cb.get("type")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("");
+                                        if cb_type == "tool_use" {
+                                            current_tool_id = cb.get("id")
+                                                .and_then(|v| v.as_str())
+                                                .map(String::from)
+                                                .unwrap_or_default();
+                                            current_tool_name = cb.get("name")
+                                                .and_then(|v| v.as_str())
+                                                .map(String::from)
+                                                .unwrap_or_default();
+                                            current_tool_input.clear();
+                                        }
+                                    }
+                                }
+                                "content_block_delta" => {
+                                    if let Some(delta) = parsed.get("delta") {
+                                        let delta_type = delta.get("type")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("");
+                                        match delta_type {
+                                            "text_delta" => {
+                                                if let Some(text) = delta.get("text").and_then(|v| v.as_str()) {
+                                                    on_token(text);
+                                                    text_response.push_str(text);
+                                                }
+                                            }
+                                            "input_json_delta" => {
+                                                if let Some(pj) = delta.get("partial_json").and_then(|v| v.as_str()) {
+                                                    current_tool_input.push_str(pj);
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                "content_block_stop" => {
+                                    // If we were accumulating a tool_use, finalize it
+                                    if !current_tool_id.is_empty() {
+                                        tool_calls.push(ToolCall {
+                                            id: core::mem::take(&mut current_tool_id),
+                                            name: core::mem::take(&mut current_tool_name),
+                                            input_json: core::mem::take(&mut current_tool_input),
+                                        });
+                                    }
+                                }
+                                "message_delta" => {
+                                    // Extract stop_reason
+                                    if let Some(delta) = parsed.get("delta") {
+                                        if let Some(sr) = delta.get("stop_reason").and_then(|v| v.as_str()) {
+                                            stop_reason = String::from(sr);
+                                        }
+                                    }
+                                }
+                                "message_stop" => {
+                                    let _ = tls.close();
+                                    return Ok(ClaudeResponse {
+                                        text: text_response,
+                                        tool_calls,
+                                        stop_reason,
+                                    });
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    let _ = tls.close();
+
+    if text_response.is_empty() && tool_calls.is_empty() {
+        Err(ApiError::EmptyResponse)
+    } else {
+        Ok(ClaudeResponse {
+            text: text_response,
+            tool_calls,
+            stop_reason,
+        })
+    }
 }
 
 /// TLS path — direct HTTPS using embedded-tls with SPKI pinning.

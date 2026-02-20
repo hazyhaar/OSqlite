@@ -7,7 +7,8 @@
 /// Think of it as a Plan 9 `rc` that speaks to the kernel directly —
 /// not a POSIX shell, not bash. Commands map to Styx namespace operations.
 pub(crate) mod line;
-mod commands;
+pub(crate) mod agent;
+pub(crate) mod commands;
 
 use crate::{serial_print, serial_println};
 
