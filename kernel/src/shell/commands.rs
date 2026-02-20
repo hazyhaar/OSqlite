@@ -140,7 +140,7 @@ fn cmd_help() {
     serial_println!("  resolve <ip>     set api.anthropic.com IP (override DNS)");
     serial_println!("  ask <prompt>     send message via TLS (auto-resolves DNS)");
     serial_println!("  askp <prompt>    send message via proxy (plain HTTP)");
-    serial_println!("  model <name>     set model (default: claude-sonnet-4-5-20250929)");
+    serial_println!("  model <name>     set model (default: claude-sonnet-4-6-20250514)");
     serial_println!("  pin [show|set]   manage TLS certificate SPKI pin");
     serial_println!();
     serial_println!("  clear         clear screen");
