@@ -434,7 +434,7 @@ unsafe extern "C" fn lua_ask(L: *mut LuaState) -> c_int {
                 return 2;
             }
         };
-        (None, vec![crate::api::Message { role: "user", content: prompt }])
+        (None, vec![crate::api::Message::text("user", prompt)])
     } else if arg_type == LUA_TTABLE {
         // Table mode: ask({system="...", messages={...}})
         let mut system = None;
@@ -503,6 +503,7 @@ unsafe extern "C" fn lua_ask(L: *mut LuaState) -> c_int {
         },
         system,
         messages,
+        use_tools: false,
     };
 
     // Send request (no streaming to console for Lua — collect full response)
@@ -565,10 +566,7 @@ unsafe fn parse_messages_table(L: *mut LuaState, table_idx: c_int) -> Vec<crate:
                 _ => "user",
             };
 
-            messages.push(crate::api::Message {
-                role: static_role,
-                content,
-            });
+            messages.push(crate::api::Message::text(static_role, content));
         }
         lua_pop(L, 1); // pop value, keep key for next iteration
     }

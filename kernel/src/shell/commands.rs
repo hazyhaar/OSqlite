@@ -17,6 +17,9 @@ use smoltcp::wire::Ipv4Address;
 /// If 0.0.0.0, the `ask` command will try DNS resolution first.
 static API_TARGET_IP: Mutex<Ipv4Address> = Mutex::new(Ipv4Address::new(0, 0, 0, 0));
 
+/// Public accessor for the agent module.
+pub(crate) static API_TARGET_IP_ACCESSOR: &Mutex<Ipv4Address> = &API_TARGET_IP;
+
 /// Dispatch a command line to the appropriate handler.
 pub fn dispatch(line: &str) {
     let mut parts = line.split_whitespace();
@@ -105,6 +108,23 @@ pub fn dispatch(line: &str) {
                 serial_println!("usage: store <path> <lua code>");
             }
         }
+        "agent" => {
+            let rest: alloc::string::String = parts.collect::<alloc::vec::Vec<&str>>().join(" ");
+            if rest.is_empty() {
+                serial_println!("usage: agent <prompt>");
+                serial_println!("  Starts an agentic loop with tool use (read, write, sql, etc.)");
+            } else {
+                cmd_agent(&rest, true);
+            }
+        }
+        "agentp" => {
+            let rest: alloc::string::String = parts.collect::<alloc::vec::Vec<&str>>().join(" ");
+            if rest.is_empty() {
+                serial_println!("usage: agentp <prompt>  (proxy mode)");
+            } else {
+                cmd_agent(&rest, false);
+            }
+        }
         "lua" => cmd_lua_repl(),
         "clear" => cmd_clear(),
         "panic" => cmd_panic(),
@@ -140,6 +160,8 @@ fn cmd_help() {
     serial_println!("  resolve <ip>     set api.anthropic.com IP (override DNS)");
     serial_println!("  ask <prompt>     send message via TLS (auto-resolves DNS)");
     serial_println!("  askp <prompt>    send message via proxy (plain HTTP)");
+    serial_println!("  agent <prompt>   agentic loop with tool use (read/write/sql)");
+    serial_println!("  agentp <prompt>  agentic loop via proxy");
     serial_println!("  model <name>     set model (default: claude-sonnet-4-6-20250514)");
     serial_println!("  pin [show|set]   manage TLS certificate SPKI pin");
     serial_println!();
@@ -564,6 +586,21 @@ fn cmd_store(path: &str, code: &str) {
     match db.exec(&query) {
         Ok(()) => serial_println!("stored: {} ({} bytes)", path, code.len()),
         Err(e) => serial_println!("error: {}", e),
+    }
+}
+
+fn cmd_agent(prompt: &str, use_tls: bool) {
+    serial_println!("[agent] Starting agentic loop...");
+    match super::agent::run_agent_loop(prompt, use_tls) {
+        Ok(_) => {
+            serial_println!("[agent] Done.");
+        }
+        Err(e) => {
+            serial_println!("[agent] Error: {}", e);
+            if use_tls {
+                serial_println!("  Fallback: agentp <prompt> (uses proxy)");
+            }
+        }
     }
 }
 
