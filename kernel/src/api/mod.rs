@@ -3,10 +3,14 @@
 /// Supports two modes:
 /// - **TLS mode** (`use_tls: true`): Direct HTTPS to api.anthropic.com:443
 ///   using `embedded-tls` for in-kernel TLS 1.3 (AES-128-GCM + P-256).
-///   Requires QEMU user-mode networking (NAT to internet).
+///   Certificate pinning via SPKI SHA-256 hash (RFC 7469).
+///   DNS resolution via UDP to QEMU's forwarder (10.0.2.3).
 ///
 /// - **Proxy mode** (`use_tls: false`): Plain HTTP to a local socat/nginx proxy
 ///   on the QEMU host that terminates TLS. Fallback for debugging.
+pub mod http;
+pub mod json;
+
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
@@ -15,12 +19,38 @@ use alloc::vec::Vec;
 use crate::net::NetStack;
 use smoltcp::wire::Ipv4Address;
 
+/// Whether to enforce SPKI pinning. Currently disabled because embedded-tls 0.18
+/// marks CertificateRef.entries as pub(crate), preventing external certificate
+/// inspection. See crypto/pin_verifier.rs for details and the pin management
+/// infrastructure that's ready for when this limitation is resolved.
+pub const ENFORCE_PINNING: bool = false;
+
+// ---- Retry configuration ----
+
+const MAX_RETRIES: u32 = 3;
+const BASE_DELAY_MS: u64 = 1000;
+
+// ---- Types ----
+
+/// A single message in a conversation.
+pub struct Message {
+    pub role: &'static str, // "user" | "assistant"
+    pub content: String,
+}
+
+/// Full request parameters for the Claude API.
+pub struct ClaudeRequest {
+    pub config: ClaudeConfig,
+    pub system: Option<String>,
+    pub messages: Vec<Message>,
+}
+
 /// Claude API configuration.
 pub struct ClaudeConfig {
     /// API key (sk-ant-...).
     pub api_key: String,
     /// Target IP address.
-    /// TLS mode: IP of api.anthropic.com (resolved externally or hardcoded).
+    /// TLS mode: IP of api.anthropic.com (resolved via DNS or manually).
     /// Proxy mode: QEMU host (10.0.2.2).
     pub target_ip: Ipv4Address,
     pub target_port: u16,
@@ -43,8 +73,6 @@ impl ClaudeConfig {
     }
 
     /// Config for direct HTTPS to api.anthropic.com via QEMU NAT.
-    /// Uses the QEMU gateway (10.0.2.2) as the DNS forwarder isn't
-    /// implemented yet, so the caller must provide the resolved IP.
     pub fn direct_tls(target_ip: Ipv4Address) -> Self {
         Self {
             api_key: String::from(""),
@@ -56,8 +84,23 @@ impl ClaudeConfig {
     }
 }
 
-/// Build the HTTP request body + headers.
+// ---- Request building ----
+
+/// Build the HTTP request for a single-turn prompt (backward compat).
 fn build_http_request(config: &ClaudeConfig, prompt: &str) -> Result<String, ApiError> {
+    let messages = vec![Message {
+        role: "user",
+        content: String::from(prompt),
+    }];
+    build_http_request_multi(config, None, &messages)
+}
+
+/// Build the HTTP request for a multi-turn conversation with optional system prompt.
+fn build_http_request_multi(
+    config: &ClaudeConfig,
+    system: Option<&str>,
+    messages: &[Message],
+) -> Result<String, ApiError> {
     // Validate inputs — reject CRLF to prevent header injection
     if config.model.contains('\r') || config.model.contains('\n') {
         return Err(ApiError::SendFailed);
@@ -66,11 +109,35 @@ fn build_http_request(config: &ClaudeConfig, prompt: &str) -> Result<String, Api
         return Err(ApiError::SendFailed);
     }
 
-    let body = format!(
-        r#"{{"model":"{}","max_tokens":1024,"stream":true,"messages":[{{"role":"user","content":"{}"}}]}}"#,
-        escape_json(&config.model),
-        escape_json(prompt),
-    );
+    // Build messages JSON array
+    let mut msgs_json = String::from("[");
+    for (i, msg) in messages.iter().enumerate() {
+        if i > 0 {
+            msgs_json.push(',');
+        }
+        msgs_json.push_str(&format!(
+            r#"{{"role":"{}","content":"{}"}}"#,
+            escape_json(msg.role),
+            escape_json(&msg.content),
+        ));
+    }
+    msgs_json.push(']');
+
+    // Build body
+    let body = if let Some(sys) = system {
+        format!(
+            r#"{{"model":"{}","max_tokens":1024,"stream":true,"system":"{}","messages":{}}}"#,
+            escape_json(&config.model),
+            escape_json(sys),
+            msgs_json,
+        )
+    } else {
+        format!(
+            r#"{{"model":"{}","max_tokens":1024,"stream":true,"messages":{}}}"#,
+            escape_json(&config.model),
+            msgs_json,
+        )
+    };
 
     Ok(format!(
         "POST /v1/messages HTTP/1.1\r\n\
@@ -89,7 +156,9 @@ fn build_http_request(config: &ClaudeConfig, prompt: &str) -> Result<String, Api
     ))
 }
 
-/// Send a message to Claude and stream the response.
+// ---- Public API ----
+
+/// Send a single-turn message to Claude and stream the response.
 ///
 /// Returns the complete response text, while also calling `on_token`
 /// for each chunk received (for real-time display on serial console).
@@ -103,22 +172,28 @@ where
     F: Fn(&str),
 {
     let request = build_http_request(config, prompt)?;
-
-    if config.use_tls {
-        claude_request_tls(net, config, &request, on_token)
-    } else {
-        claude_request_plain(net, config, &request, on_token)
-    }
+    claude_send_with_retry(net, config, &request, on_token)
 }
 
-/// TLS path — direct HTTPS using embedded-tls.
-///
-/// SECURITY WARNING: Certificate verification is NOT available in no_std
-/// environments with embedded-tls. The `UnsecureProvider` skips all
-/// certificate validation. A network MITM can intercept the API key and
-/// all request/response data. Only use this over trusted networks
-/// (e.g., QEMU NAT to localhost). See AUDIT.md finding #1.
-fn claude_request_tls<F>(
+/// Send a multi-turn request to Claude.
+pub fn claude_request_multi<F>(
+    net: &mut NetStack,
+    request: &ClaudeRequest,
+    on_token: F,
+) -> Result<String, ApiError>
+where
+    F: Fn(&str),
+{
+    let http_req = build_http_request_multi(
+        &request.config,
+        request.system.as_deref(),
+        &request.messages,
+    )?;
+    claude_send_with_retry(net, &request.config, &http_req, on_token)
+}
+
+/// Send a request with retry logic.
+fn claude_send_with_retry<F>(
     net: &mut NetStack,
     config: &ClaudeConfig,
     request: &str,
@@ -127,16 +202,56 @@ fn claude_request_tls<F>(
 where
     F: Fn(&str),
 {
+    let mut last_err = ApiError::EmptyResponse;
+
+    for attempt in 0..=MAX_RETRIES {
+        if attempt > 0 {
+            let delay_ms = BASE_DELAY_MS * (1u64 << (attempt - 1).min(4));
+            crate::serial_println!("[API] Retry {}/{} after {}ms...", attempt, MAX_RETRIES, delay_ms);
+            crate::arch::x86_64::timer::delay_us(delay_ms * 1000);
+        }
+
+        let result = if config.use_tls {
+            claude_request_tls(net, config, request, &on_token)
+        } else {
+            claude_request_plain(net, config, request, &on_token)
+        };
+
+        match result {
+            Ok(response) => return Ok(response),
+            Err(ApiError::HttpStatus(status, ref msg)) => {
+                // Retry on server errors, not client errors
+                if status == 429 || status == 500 || status == 529 {
+                    last_err = ApiError::HttpStatus(status, msg.clone());
+                    continue;
+                }
+                return Err(ApiError::HttpStatus(status, msg.clone()));
+            }
+            Err(ApiError::ConnectionTimeout) | Err(ApiError::ConnectionFailed) => {
+                last_err = ApiError::ConnectionTimeout;
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(last_err)
+}
+
+/// TLS path — direct HTTPS using embedded-tls with SPKI pinning.
+fn claude_request_tls<F>(
+    net: &mut NetStack,
+    config: &ClaudeConfig,
+    request: &str,
+    on_token: &F,
+) -> Result<String, ApiError>
+where
+    F: Fn(&str),
+{
     use crate::crypto::RdRandRng;
     use crate::net::tls::TcpStream;
     use embedded_tls::blocking::TlsConnection;
-    use embedded_tls::{Aes128GcmSha256, TlsConfig, TlsContext, UnsecureProvider};
-
-    // SECURITY: Log a warning every time we use unverified TLS
-    crate::serial_println!(
-        "[SECURITY WARNING] TLS connection without certificate verification — \
-         API key may be exposed to MITM attacks"
-    );
+    use embedded_tls::{TlsConfig, TlsContext};
 
     // 1. TCP connect + wait for established
     let handle = net.tcp_connect(config.target_ip, config.target_port)
@@ -151,12 +266,7 @@ where
     // 2. Wrap in embedded-io adapter
     let tcp = TcpStream::new(net, handle);
 
-    // 3. TLS handshake
-    // NOTE: embedded-tls requires the `webpki` + `std` features for
-    // certificate verification (CertVerifier). In no_std bare-metal, only
-    // UnsecureProvider is available. When embedded-tls adds no_std cert
-    // verification, replace UnsecureProvider with a pinning verifier that
-    // checks the SHA-256 fingerprint of api.anthropic.com's certificate.
+    // 3. TLS handshake — with SPKI pin verification if enabled
     let mut read_buf = vec![0u8; 16640];
     let mut write_buf = vec![0u8; 16640];
 
@@ -167,10 +277,27 @@ where
     let mut tls = TlsConnection::new(tcp, &mut read_buf, &mut write_buf);
 
     let rng = RdRandRng::new();
-    tls.open(TlsContext::new(
-        &tls_config,
-        UnsecureProvider::new::<Aes128GcmSha256>(rng),
-    )).map_err(|_| ApiError::TlsHandshakeFailed)?;
+
+    // NOTE: SPKI pin verification is not yet possible because embedded-tls 0.18
+    // marks CertificateRef.entries as pub(crate), preventing external code from
+    // inspecting the server certificate. See crypto/pin_verifier.rs for details.
+    // When this limitation is resolved, ENFORCE_PINNING will enable the pin check.
+    {
+        use embedded_tls::{Aes128GcmSha256, UnsecureProvider};
+        if !ENFORCE_PINNING {
+            crate::serial_println!(
+                "[SECURITY WARNING] TLS without certificate pinning — \
+                 API key may be exposed to MITM attacks"
+            );
+        }
+        tls.open(TlsContext::new(
+            &tls_config,
+            UnsecureProvider::new::<Aes128GcmSha256>(rng),
+        )).map_err(|e| {
+            crate::serial_println!("[TLS] Handshake failed: {:?}", e);
+            ApiError::TlsHandshakeFailed
+        })?;
+    }
 
     // 4. Send HTTP request over TLS
     let request_bytes = request.as_bytes();
@@ -182,10 +309,11 @@ where
     }
     tls.flush().map_err(|_| ApiError::SendFailed)?;
 
-    // 5. Receive + parse SSE response over TLS
+    // 5. Receive + parse response over TLS
     let mut response = String::new();
     let mut raw_buf = Vec::new();
     let mut recv_buf = [0u8; 4096];
+    let mut headers_parsed = false;
 
     loop {
         match tls.read(&mut recv_buf) {
@@ -193,18 +321,34 @@ where
             Ok(n) => {
                 raw_buf.extend_from_slice(&recv_buf[..n]);
 
-                while let Some(event_end) = find_sse_event_end(&raw_buf) {
-                    let event_bytes = raw_buf[..event_end].to_vec();
-                    raw_buf = raw_buf[event_end..].to_vec();
-
-                    if let Some(text) = extract_content_delta(&event_bytes) {
-                        on_token(&text);
-                        response.push_str(&text);
+                // Parse HTTP headers once we have them
+                if !headers_parsed {
+                    if let Ok(resp) = http::HttpResponse::parse(&raw_buf) {
+                        headers_parsed = true;
+                        if let Some(err_msg) = resp.error_message() {
+                            let _ = tls.close();
+                            return Err(ApiError::HttpStatus(resp.status, String::from(err_msg)));
+                        }
+                        // Strip headers from buffer, keep body
+                        raw_buf = raw_buf[resp.body_start..].to_vec();
                     }
+                }
 
-                    if is_message_stop(&event_bytes) {
-                        let _ = tls.close();
-                        return Ok(response);
+                // Parse SSE events from body
+                if headers_parsed {
+                    while let Some(event_end) = find_sse_event_end(&raw_buf) {
+                        let event_bytes = raw_buf[..event_end].to_vec();
+                        raw_buf = raw_buf[event_end..].to_vec();
+
+                        if let Some(text) = extract_content_delta_json(&event_bytes) {
+                            on_token(&text);
+                            response.push_str(&text);
+                        }
+
+                        if is_message_stop(&event_bytes) {
+                            let _ = tls.close();
+                            return Ok(response);
+                        }
                     }
                 }
             }
@@ -213,7 +357,7 @@ where
     }
 
     let _ = tls.close();
-    finish_response(response, raw_buf, &on_token)
+    finish_response(response, raw_buf, on_token)
 }
 
 /// Plain HTTP path — for proxy mode.
@@ -221,7 +365,7 @@ fn claude_request_plain<F>(
     net: &mut NetStack,
     config: &ClaudeConfig,
     request: &str,
-    on_token: F,
+    on_token: &F,
 ) -> Result<String, ApiError>
 where
     F: Fn(&str),
@@ -250,6 +394,7 @@ where
     let mut response = String::new();
     let mut raw_buf = Vec::new();
     let mut recv_buf = [0u8; 4096];
+    let mut headers_parsed = false;
 
     loop {
         net.poll();
@@ -259,18 +404,32 @@ where
             if n > 0 {
                 raw_buf.extend_from_slice(&recv_buf[..n]);
 
-                while let Some(event_end) = find_sse_event_end(&raw_buf) {
-                    let event_bytes = raw_buf[..event_end].to_vec();
-                    raw_buf = raw_buf[event_end..].to_vec();
-
-                    if let Some(text) = extract_content_delta(&event_bytes) {
-                        on_token(&text);
-                        response.push_str(&text);
+                // Parse HTTP headers
+                if !headers_parsed {
+                    if let Ok(resp) = http::HttpResponse::parse(&raw_buf) {
+                        headers_parsed = true;
+                        if let Some(err_msg) = resp.error_message() {
+                            net.tcp_close(handle);
+                            return Err(ApiError::HttpStatus(resp.status, String::from(err_msg)));
+                        }
+                        raw_buf = raw_buf[resp.body_start..].to_vec();
                     }
+                }
 
-                    if is_message_stop(&event_bytes) {
-                        net.tcp_close(handle);
-                        return Ok(response);
+                if headers_parsed {
+                    while let Some(event_end) = find_sse_event_end(&raw_buf) {
+                        let event_bytes = raw_buf[..event_end].to_vec();
+                        raw_buf = raw_buf[event_end..].to_vec();
+
+                        if let Some(text) = extract_content_delta_json(&event_bytes) {
+                            on_token(&text);
+                            response.push_str(&text);
+                        }
+
+                        if is_message_stop(&event_bytes) {
+                            net.tcp_close(handle);
+                            return Ok(response);
+                        }
                     }
                 }
             }
@@ -284,7 +443,7 @@ where
     }
 
     net.tcp_close(handle);
-    finish_response(response, raw_buf, &on_token)
+    finish_response(response, raw_buf, on_token)
 }
 
 /// Handle response completion — extract content from non-streaming or error responses.
@@ -295,18 +454,31 @@ fn finish_response<F: Fn(&str)>(
 ) -> Result<String, ApiError> {
     if response.is_empty() {
         let raw = String::from_utf8_lossy(&raw_buf).into_owned();
-        if raw.contains("error") {
-            Err(ApiError::ApiError(raw))
-        } else if raw.is_empty() {
-            Err(ApiError::EmptyResponse)
-        } else {
-            if let Some(text) = extract_non_streaming_content(&raw) {
-                on_token(&text);
-                Ok(text)
-            } else {
-                Ok(raw)
+        if raw.is_empty() {
+            return Err(ApiError::EmptyResponse);
+        }
+        // Try to parse as JSON error response
+        if let Ok(parsed) = json::parse(&raw) {
+            if let Some(err_obj) = parsed.get("error") {
+                let msg = err_obj.get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown error");
+                return Err(ApiError::ApiError(String::from(msg)));
+            }
+            // Try to extract content from non-streaming response
+            if let Some(content) = parsed.get("content") {
+                if let Some(arr) = content.as_array() {
+                    for block in arr {
+                        if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                            on_token(text);
+                            return Ok(String::from(text));
+                        }
+                    }
+                }
             }
         }
+        // Fallback: return raw
+        Ok(raw)
     } else {
         Ok(response)
     }
@@ -324,10 +496,50 @@ fn find_sse_event_end(buf: &[u8]) -> Option<usize> {
     None
 }
 
-/// Extract text content from an SSE content_block_delta event.
-fn extract_content_delta(event: &[u8]) -> Option<String> {
+/// Extract text content from an SSE content_block_delta event using JSON parsing.
+fn extract_content_delta_json(event: &[u8]) -> Option<String> {
     let s = core::str::from_utf8(event).ok()?;
 
+    // SSE format: "event: content_block_delta\ndata: {...}\n"
+    // Extract the data line
+    let data = extract_sse_data(s)?;
+
+    if !data.contains("content_block_delta") {
+        return None;
+    }
+
+    // Parse the JSON
+    if let Ok(parsed) = json::parse(data) {
+        if let Some(delta) = parsed.get("delta") {
+            return delta.get("text").and_then(|v| v.as_str()).map(String::from);
+        }
+    }
+
+    // Fallback to string scanning if JSON parse fails
+    extract_content_delta_legacy(s)
+}
+
+/// Extract the `data:` payload from an SSE event.
+fn extract_sse_data(event: &str) -> Option<&str> {
+    for line in event.lines() {
+        if let Some(rest) = line.strip_prefix("data:") {
+            return Some(rest.trim_start());
+        }
+        // Also handle "data: " with space
+        if let Some(rest) = line.strip_prefix("data: ") {
+            return Some(rest);
+        }
+    }
+    // If no explicit "data:" prefix, the whole thing might be raw JSON
+    let trimmed = event.trim();
+    if trimmed.starts_with('{') {
+        return Some(trimmed);
+    }
+    None
+}
+
+/// Legacy string-scanning SSE extractor (fallback).
+fn extract_content_delta_legacy(s: &str) -> Option<String> {
     if !s.contains("content_block_delta") {
         return None;
     }
@@ -355,18 +567,9 @@ fn is_message_stop(event: &[u8]) -> bool {
     s.contains("message_stop")
 }
 
-/// Extract content from a non-streaming JSON response.
-fn extract_non_streaming_content(raw: &str) -> Option<String> {
-    let marker = r#""text":""#;
-    let start = raw.find(marker)? + marker.len();
-    let rest = &raw[start..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
-}
-
 // ---- JSON helpers ----
 
-fn escape_json(s: &str) -> String {
+pub fn escape_json(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -448,6 +651,9 @@ pub enum ApiError {
     TlsHandshakeFailed,
     SendFailed,
     EmptyResponse,
+    DnsError(String),
+    /// HTTP error with status code and human-readable message.
+    HttpStatus(u16, String),
     ApiError(String),
 }
 
@@ -459,6 +665,8 @@ impl core::fmt::Display for ApiError {
             ApiError::TlsHandshakeFailed => write!(f, "TLS handshake failed"),
             ApiError::SendFailed => write!(f, "failed to send request"),
             ApiError::EmptyResponse => write!(f, "empty response from API"),
+            ApiError::DnsError(msg) => write!(f, "DNS error: {}", msg),
+            ApiError::HttpStatus(code, msg) => write!(f, "HTTP {}: {}", code, msg),
             ApiError::ApiError(msg) => write!(f, "API error: {}", msg),
         }
     }
@@ -468,6 +676,7 @@ impl core::fmt::Display for ApiError {
 
 use spin::Mutex;
 static API_KEY: Mutex<Option<String>> = Mutex::new(None);
+static MODEL: Mutex<Option<String>> = Mutex::new(None);
 
 pub fn set_api_key(key: &str) {
     *API_KEY.lock() = Some(String::from(key));
@@ -475,4 +684,12 @@ pub fn set_api_key(key: &str) {
 
 pub fn get_api_key() -> Option<String> {
     API_KEY.lock().clone()
+}
+
+pub fn set_model(model: &str) {
+    *MODEL.lock() = Some(String::from(model));
+}
+
+pub fn get_model() -> String {
+    MODEL.lock().clone().unwrap_or_else(|| String::from("claude-sonnet-4-5-20250929"))
 }

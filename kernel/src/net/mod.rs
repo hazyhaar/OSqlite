@@ -5,10 +5,12 @@
 ///       ↓ ↑
 ///   SmoltcpDevice (implements smoltcp::phy::Device)
 ///       ↓ ↑
-///   smoltcp Interface (ARP, IP, TCP)
+///   smoltcp Interface (ARP, IP, TCP, UDP)
 ///       ↓ ↑
 ///   TCP sockets (used by HTTP client, TLS, etc.)
+///   UDP sockets (used by DNS resolver)
 mod device;
+pub mod dns;
 pub mod stack;
 pub mod tls;
 

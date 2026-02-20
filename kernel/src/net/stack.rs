@@ -3,14 +3,15 @@
 /// Provides:
 /// - DHCP for automatic IP configuration
 /// - TCP socket creation and I/O
-/// - DNS resolution (static for now — api.anthropic.com hardcoded)
+/// - UDP socket creation and I/O (for DNS)
 use alloc::vec;
 use core::sync::atomic::{AtomicU16, Ordering};
 
 use smoltcp::iface::{Config, Interface, SocketSet, SocketHandle};
 use smoltcp::socket::tcp::{self, Socket as TcpSocket};
+use smoltcp::socket::udp::Socket as UdpSocket;
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr};
+use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv4Cidr};
 
 use super::device::SmoltcpDevice;
 
@@ -156,5 +157,51 @@ impl NetStack {
             }
             core::hint::spin_loop();
         }
+    }
+
+    // ---- UDP support (for DNS) ----
+
+    /// Add a UDP socket to the socket set.
+    pub fn add_udp_socket(&mut self, socket: UdpSocket<'static>) -> SocketHandle {
+        self.sockets.add(socket)
+    }
+
+    /// Bind a UDP socket to a local port.
+    pub fn udp_bind(&mut self, handle: SocketHandle, port: u16) -> Result<(), ()> {
+        let socket = self.sockets.get_mut::<UdpSocket>(handle);
+        socket.bind(port).map_err(|_| ())
+    }
+
+    /// Send a UDP datagram.
+    pub fn udp_send(
+        &mut self,
+        handle: SocketHandle,
+        data: &[u8],
+        endpoint: IpEndpoint,
+    ) -> Result<(), ()> {
+        let socket = self.sockets.get_mut::<UdpSocket>(handle);
+        socket.send_slice(data, endpoint).map_err(|_| ())?;
+        self.poll();
+        Ok(())
+    }
+
+    /// Receive a UDP datagram. Returns the number of bytes received, or None.
+    pub fn udp_recv(&mut self, handle: SocketHandle, buf: &mut [u8]) -> Option<usize> {
+        let socket = self.sockets.get_mut::<UdpSocket>(handle);
+        match socket.recv_slice(buf) {
+            Ok((n, _endpoint)) => Some(n),
+            Err(_) => None,
+        }
+    }
+
+    /// Remove a socket from the socket set.
+    pub fn remove_socket(&mut self, handle: SocketHandle) {
+        self.sockets.remove(handle);
+    }
+
+    /// Get the next ephemeral port number.
+    pub fn next_ephemeral_port(&self) -> u16 {
+        let offset = EPHEMERAL_PORT.fetch_add(1, Ordering::Relaxed);
+        49152 + (offset % 16384)
     }
 }

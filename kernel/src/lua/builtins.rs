@@ -8,7 +8,10 @@
 //! sleep(ms)          — busy-wait using TSC
 //! now()              — monotonic timestamp in ms
 //! audit(level, action, detail) — write to audit table
+//! ask(prompt) or ask(table)   — call Claude API → string
 
+use alloc::vec;
+use alloc::vec::Vec;
 use core::ffi::{c_char, c_int};
 use super::ffi::*;
 use crate::sqlite::SqlValue;
@@ -23,6 +26,7 @@ pub unsafe fn register_builtins(L: *mut LuaState) {
     lua_register(L, b"sleep\0".as_ptr() as _, lua_sleep);
     lua_register(L, b"now\0".as_ptr() as _, lua_now);
     lua_register(L, b"audit\0".as_ptr() as _, lua_audit);
+    lua_register(L, b"ask\0".as_ptr() as _, lua_ask);
 }
 
 // ============================================================
@@ -374,6 +378,202 @@ unsafe extern "C" fn lua_audit(L: *mut LuaState) -> c_int {
     }
 
     0
+}
+
+// ============================================================
+// ask(prompt) or ask({system=..., messages={...}}) → string
+// ============================================================
+
+/// Rate limit: minimum interval between ask() calls (ms).
+const ASK_MIN_INTERVAL_MS: u64 = 10_000;
+static LAST_ASK_MS: spin::Mutex<u64> = spin::Mutex::new(0);
+
+unsafe extern "C" fn lua_ask(L: *mut LuaState) -> c_int {
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    // Rate limiting
+    let now_ms = crate::arch::x86_64::timer::monotonic_ms();
+    {
+        let mut last = LAST_ASK_MS.lock();
+        if now_ms - *last < ASK_MIN_INTERVAL_MS {
+            lua_pushnil(L);
+            push_rust_string(L, "ask() rate limited (10s between calls)");
+            return 2;
+        }
+        *last = now_ms;
+    }
+
+    // Check API key
+    let api_key = match crate::api::get_api_key() {
+        Some(k) => k,
+        None => {
+            lua_pushnil(L);
+            push_rust_string(L, "API key not set");
+            return 2;
+        }
+    };
+
+    // Parse arguments: either a string or a table
+    let arg_type = lua_type(L, 1);
+
+    let (system, messages) = if arg_type == LUA_TSTRING {
+        // Simple mode: ask("prompt")
+        let prompt = match lua_to_str(L, 1) {
+            Some(b) => match core::str::from_utf8(b) {
+                Ok(s) => String::from(s),
+                Err(_) => {
+                    lua_pushnil(L);
+                    push_rust_string(L, "invalid UTF-8 in prompt");
+                    return 2;
+                }
+            },
+            None => {
+                lua_pushnil(L);
+                push_rust_string(L, "ask() requires a string or table argument");
+                return 2;
+            }
+        };
+        (None, vec![crate::api::Message { role: "user", content: prompt }])
+    } else if arg_type == LUA_TTABLE {
+        // Table mode: ask({system="...", messages={...}})
+        let mut system = None;
+        let mut messages = Vec::new();
+
+        // Get system field
+        lua_getfield(L, 1, b"system\0".as_ptr() as *const c_char);
+        if !lua_isnil(L, -1) {
+            if let Some(b) = lua_to_str(L, -1) {
+                if let Ok(s) = core::str::from_utf8(b) {
+                    system = Some(String::from(s));
+                }
+            }
+        }
+        lua_pop(L, 1);
+
+        // Get messages array
+        lua_getfield(L, 1, b"messages\0".as_ptr() as *const c_char);
+        if lua_type(L, -1) == LUA_TTABLE {
+            let msg_table_idx = lua_gettop(L);
+            messages = parse_messages_table(L, msg_table_idx);
+        }
+        lua_pop(L, 1); // pop messages
+
+        if messages.is_empty() {
+            lua_pushnil(L);
+            push_rust_string(L, "ask() table must contain 'messages' array");
+            return 2;
+        }
+
+        (system, messages)
+    } else {
+        lua_pushnil(L);
+        push_rust_string(L, "ask() requires a string or table argument");
+        return 2;
+    };
+
+    // Acquire network stack
+    let mut net_guard = crate::net::NET_STACK.lock();
+    let net = match net_guard.as_mut() {
+        Some(n) => n,
+        None => {
+            lua_pushnil(L);
+            push_rust_string(L, "network stack not initialized");
+            return 2;
+        }
+    };
+
+    // Resolve API target IP
+    let target_ip = match crate::net::dns::resolve_a(net, "api.anthropic.com") {
+        Ok(ip) => ip,
+        Err(e) => {
+            lua_pushnil(L);
+            let msg = alloc::format!("DNS resolution failed: {}", e);
+            push_rust_string(L, &msg);
+            return 2;
+        }
+    };
+
+    // Build request
+    let request = crate::api::ClaudeRequest {
+        config: crate::api::ClaudeConfig {
+            api_key,
+            model: crate::api::get_model(),
+            ..crate::api::ClaudeConfig::direct_tls(target_ip)
+        },
+        system,
+        messages,
+    };
+
+    // Send request (no streaming to console for Lua — collect full response)
+    let result = crate::api::claude_request_multi(net, &request, |_| {});
+    drop(net_guard);
+
+    match result {
+        Ok(text) => {
+            audit_log(L, "API_CALL", "ask()");
+            lua_pushlstring(L, text.as_ptr() as *const c_char, text.len());
+            1
+        }
+        Err(e) => {
+            let msg = alloc::format!("{}", e);
+            lua_pushnil(L);
+            push_rust_string(L, &msg);
+            2
+        }
+    }
+}
+
+/// Parse a Lua messages table into a Vec<Message>.
+/// Expects: { {role="user", content="..."}, {role="assistant", content="..."}, ... }
+/// Uses lua_next to iterate the array.
+unsafe fn parse_messages_table(L: *mut LuaState, table_idx: c_int) -> Vec<crate::api::Message> {
+    use alloc::string::String;
+
+    let mut messages = Vec::new();
+
+    lua_pushnil(L); // first key
+    while lua_next(L, table_idx) != 0 {
+        // key at -2, value at -1
+        if lua_type(L, -1) == LUA_TTABLE {
+            let msg_idx = lua_gettop(L);
+
+            let mut role = String::from("user");
+            let mut content = String::new();
+
+            // Get role
+            lua_getfield(L, msg_idx, b"role\0".as_ptr() as *const c_char);
+            if let Some(b) = lua_to_str(L, -1) {
+                if let Ok(s) = core::str::from_utf8(b) {
+                    role = String::from(s);
+                }
+            }
+            lua_pop(L, 1);
+
+            // Get content
+            lua_getfield(L, msg_idx, b"content\0".as_ptr() as *const c_char);
+            if let Some(b) = lua_to_str(L, -1) {
+                if let Ok(s) = core::str::from_utf8(b) {
+                    content = String::from(s);
+                }
+            }
+            lua_pop(L, 1);
+
+            // Map role string to static
+            let static_role: &'static str = match role.as_str() {
+                "assistant" => "assistant",
+                _ => "user",
+            };
+
+            messages.push(crate::api::Message {
+                role: static_role,
+                content,
+            });
+        }
+        lua_pop(L, 1); // pop value, keep key for next iteration
+    }
+
+    messages
 }
 
 // ============================================================
