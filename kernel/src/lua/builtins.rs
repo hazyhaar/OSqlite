@@ -50,13 +50,10 @@ unsafe extern "C" fn lua_sql(L: *mut LuaState) -> c_int {
     // Check registry flag _SQL_READONLY; if set, only allow SELECT/EXPLAIN/PRAGMA.
     let restricted = is_sql_restricted(L);
     if restricted {
-        let upper = query.trim_start();
-        let allowed = upper.starts_with("SELECT")
-            || upper.starts_with("select")
-            || upper.starts_with("EXPLAIN")
-            || upper.starts_with("explain")
-            || upper.starts_with("PRAGMA")
-            || upper.starts_with("pragma");
+        let trimmed = query.trim_start().as_bytes();
+        let allowed = starts_with_ignore_case(trimmed, b"SELECT")
+            || starts_with_ignore_case(trimmed, b"EXPLAIN")
+            || starts_with_ignore_case(trimmed, b"PRAGMA");
         if !allowed {
             lua_pushnil(L);
             lua_pushstring(L, b"sql() is read-only for agents\0".as_ptr() as _);
@@ -382,6 +379,19 @@ unsafe extern "C" fn lua_audit(L: *mut LuaState) -> c_int {
 // ============================================================
 // Internal helpers
 // ============================================================
+
+/// Case-insensitive prefix check on byte slices.
+fn starts_with_ignore_case(haystack: &[u8], needle: &[u8]) -> bool {
+    if haystack.len() < needle.len() {
+        return false;
+    }
+    for (h, n) in haystack[..needle.len()].iter().zip(needle.iter()) {
+        if h.to_ascii_uppercase() != n.to_ascii_uppercase() {
+            return false;
+        }
+    }
+    true
+}
 
 /// Check if SQL is restricted to read-only for this Lua state.
 unsafe fn is_sql_restricted(L: *mut LuaState) -> bool {

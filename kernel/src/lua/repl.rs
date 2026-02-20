@@ -26,7 +26,7 @@ pub fn run() {
         }
 
         luaL_openlibs(L);
-        lua_gc(L, LUA_GCINC, 100, 200, 10);
+        lua_gc(L, LUA_GCINC, 100 as core::ffi::c_int, 200 as core::ffi::c_int, 10 as core::ffi::c_int);
         register_builtins(L);
 
         // Store agent name for audit
