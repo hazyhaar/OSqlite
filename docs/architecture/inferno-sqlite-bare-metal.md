@@ -1,11 +1,16 @@
 # HeavenOS — Inferno/SQLite Bare-Metal Architecture
 
-## Design Document v1.0
+## Design Document v2.0
 
 **Scope**: This document specifies how SQLite operates directly on NVMe
 hardware (no Linux, no libc) inside an Inferno/Plan 9-inspired Rust kernel,
-and how the resulting system exposes AI workloads through a Styx (9P2000)
-namespace while keeping the GPU data path out of the file abstraction.
+how the system exposes state through a namespace backed by SQLite, and how
+an agentic loop allows Claude to read, write, and query the system via
+tool use over TLS — all from bare metal.
+
+**Status**: Phases 0-3 of the original plan are fully implemented. The AI
+inference path pivoted from local GPU compute to Anthropic API access over
+an in-kernel TLS 1.3 stack. The agent sandbox pivoted from WASM to Lua 5.5.
 
 ---
 
@@ -15,19 +20,23 @@ namespace while keeping the GPU data path out of the file abstraction.
    configuration, agent state, logs, and structured queries. It does NOT
    carry GPU tensors, model weights, or bulk inference data.
 
-2. **"Everything is a file" is the control plane.** Styx exposes system
-   state as a namespace. Agents read/write small control messages through
-   the namespace. Bulk data moves through shared memory and DMA, signaled
-   (not transported) via Styx.
+2. **"Everything is a file" is the control plane.** The namespace exposes
+   system state as paths. Agents read/write files through the namespace,
+   backed by the SQLite `namespace` table. Bulk data moves through shared
+   memory and DMA, signaled (not transported) via the namespace.
 
 3. **No magic words.** Every claim about performance, isolation, or
    correctness must be backed by a concrete mechanism. If we say "zero
    copy," we show the physical address flow. If we say "crash safe," we
-   show the xSync → NVMe Flush path.
+   show the xSync -> NVMe Flush path.
 
 4. **Implement the hard 80%.** The VFS shim, the NVMe flush path, the
    non-aligned I/O, the shared memory for WAL — these are the actual
    engineering work, not the architectural diagram.
+
+5. **The AI is remote, not local.** Instead of running inference on a local
+   GPU, the system calls the Anthropic API over TLS 1.3 from bare metal.
+   Claude acts as the intelligence layer; OSqlite is the execution substrate.
 
 ---
 
@@ -35,10 +44,11 @@ namespace while keeping the GPU data path out of the file abstraction.
 
 | Component        | Assumption                                          |
 | ---------------- | --------------------------------------------------- |
-| CPU              | x86_64 with MMU, APIC timer, TSC                   |
+| CPU              | x86_64 with MMU, APIC timer, TSC, RDRAND           |
 | NVMe             | PCIe-attached, supports PRP lists, Flush command    |
-| RAM              | ≥ 512 MB, accessed via HHDM (higher-half direct map)|
-| GPU (optional)   | PCIe, BAR0-mapped, vendor-specific command protocol |
+| NIC              | virtio-net (QEMU) or compatible                    |
+| RAM              | >= 512 MB, accessed via HHDM (higher-half direct map)|
+| GPU (future)     | PCIe, BAR0-mapped, vendor-specific command protocol |
 | Boot             | Limine bootloader (v9.x, limine protocol)           |
 
 ---
@@ -49,17 +59,17 @@ HeavenOS uses a **hybrid memory model**:
 
 - **Kernel space**: higher-half direct map (HHDM) provided by Limine.
   All physical memory is mapped at a fixed offset (typically 0xFFFF800000000000).
-  `PhysAddr::as_ptr()` adds the HHDM offset to convert phys→virt.
-- **User space** (if/when added): separate page tables per process.
-  For the initial single-address-space design, all code runs in ring 0.
+  `PhysAddr::as_ptr()` adds the HHDM offset to convert phys->virt.
+- All code runs in ring 0 in a single address space.
 
 ### 3.1 Physical Page Allocator
 
-A bitmap allocator tracks 4 KiB pages. It provides:
+**Implemented**: `kernel/src/mem/phys.rs`
+
+A bitmap allocator tracks 4 KiB pages (up to 4 GiB via 128 KiB bitmap):
 
 ```rust
 /// Allocate `count` physically contiguous pages, aligned to `align` pages.
-/// Returns the physical base address.
 fn alloc_pages_contiguous(count: usize, align: usize) -> Result<PhysAddr, AllocError>;
 
 /// Free previously allocated pages.
@@ -69,15 +79,17 @@ fn free_pages(base: PhysAddr, count: usize);
 **Why contiguous**: NVMe PRP lists require that each entry points to a
 physical page. For transfers > 4 KiB, either the pages are contiguous
 (single PRP entry) or we build a PRP list (scattered pages). Both paths
-must be supported.
+are supported.
 
 ### 3.2 DMA-Safe Allocator
 
+**Implemented**: `kernel/src/mem/dma.rs`
+
 Wraps the physical page allocator. Guarantees:
-- Pages are not in CPU cache (or cache is flushed before DMA read,
-  invalidated after DMA write)
-- Alignment is ≥ controller's minimum transfer unit
-- Allocations are tracked for cleanup on error paths
+- Pages are not in CPU cache (flushed before DMA read, invalidated after
+  DMA write via clflushopt + mfence)
+- Alignment >= controller's minimum transfer unit
+- Allocations tracked for cleanup on error paths
 
 ```rust
 pub struct DmaBuf {
@@ -85,101 +97,53 @@ pub struct DmaBuf {
     phys: PhysAddr,
     len: usize,
 }
-
-impl DmaBuf {
-    pub fn alloc(size: usize) -> Result<Self, AllocError> { /* ... */ }
-
-    /// Flush CPU caches for this buffer (before device reads it).
-    pub fn flush_cache(&self) { /* clflush / clflushopt loop */ }
-
-    /// Invalidate CPU caches for this buffer (after device wrote it).
-    pub fn invalidate_cache(&self) { /* clflush / clflushopt + mfence */ }
-}
-
-impl Drop for DmaBuf {
-    fn drop(&mut self) { /* free pages back to physical allocator */ }
-}
 ```
 
 ---
 
 ## 4. NVMe Driver
 
+**Implemented**: `kernel/src/drivers/nvme/` (mod.rs, queue.rs, command.rs, pci.rs)
+
 ### 4.1 Queue Pair Architecture
 
 ```
-┌─────────────────────────────────────┐
-│              NVMe Driver            │
-│                                     │
-│  Admin Queue (1 SQ + 1 CQ)         │
-│    - Identify Controller            │
-│    - Create I/O Queues              │
-│    - Firmware commands              │
-│                                     │
-│  I/O Queue Pair 0 (SQ + CQ)        │
-│    - Read / Write / Flush           │
-│    - Interrupt-driven completion    │
-│                                     │
-│  (Future: 1 QP per CPU core)       │
-└─────────────────────────────────────┘
++-------------------------------------+
+|              NVMe Driver             |
+|                                      |
+|  Admin Queue (1 SQ + 1 CQ)          |
+|    - Identify Controller/Namespace   |
+|    - Create I/O Queues               |
+|                                      |
+|  I/O Queue Pair 0 (SQ + CQ)         |
+|    - Read / Write / Flush            |
+|    - TSC-based polling (30s timeout) |
+|                                      |
+|  (Future: 1 QP per CPU core)        |
++-------------------------------------+
 ```
 
 ### 4.2 Command Submission
 
-```rust
-pub struct NvmeCommand {
-    opcode: u8,           // 0x02 = Read, 0x01 = Write, 0x00 = Flush
-    nsid: u32,            // Namespace ID (usually 1)
-    lba: u64,             // Starting Logical Block Address
-    block_count: u16,     // Number of 512B or 4KiB blocks (0-indexed)
-    prp1: PhysAddr,       // First PRP entry
-    prp2: PhysAddr,       // Second PRP entry or PRP list pointer
-}
+Synchronous submit-and-wait with TSC-based timeout. Large transfers
+(>65535 blocks) are automatically chunked. PRP lists constructed in
+DMA-safe memory for multi-page transfers.
 
-impl NvmeDriver {
-    /// Submit a command and block until completion.
-    /// Returns the NVMe status code.
-    pub fn submit_and_wait(&mut self, cmd: NvmeCommand) -> Result<(), NvmeError>;
-
-    /// Submit a command, return a token for polling/interrupt completion.
-    pub fn submit_async(&mut self, cmd: NvmeCommand) -> SubmissionToken;
-
-    /// Check/wait for completion of an async submission.
-    pub fn poll_completion(&mut self, token: SubmissionToken) -> Option<Result<(), NvmeError>>;
-}
-```
-
-### 4.3 PRP List Construction
-
-For transfers spanning multiple non-contiguous pages:
-
-```rust
-/// Build a PRP list for a DMA transfer.
-/// - If size <= 4096: prp1 = phys_addr, prp2 = 0
-/// - If size <= 8192: prp1 = phys_addr, prp2 = phys_addr + 4096
-/// - If size > 8192:  prp1 = phys_addr, prp2 = pointer to PRP list
-///   The PRP list itself must be in a DMA-accessible page.
-fn build_prp(buf: &DmaBuf) -> (PhysAddr, PhysAddr);
-fn build_prp_scattered(pages: &[PhysAddr]) -> (PhysAddr, PhysAddr, DmaBuf /* prp list */);
-```
-
-### 4.4 Error Classification
-
-NVMe completion status → SQLite error code mapping:
+### 4.3 Error Classification
 
 | NVMe Status               | SQLite Error           | Recovery                    |
 | -------------------------- | ---------------------- | --------------------------- |
-| Success                    | SQLITE_OK              | —                           |
+| Success                    | SQLITE_OK              | --                          |
 | Invalid Opcode/Field       | SQLITE_MISUSE          | Bug in driver               |
 | Data Transfer Error        | SQLITE_IOERR_READ/WRITE | Retry once, then fail      |
-| Unrecoverable Media Error  | SQLITE_IOERR_CORRUPTFS | Mark sector bad, fail       |
 | Namespace Not Ready        | SQLITE_BUSY            | Retry with backoff          |
-| Write Fault                | SQLITE_FULL            | Disk likely failing         |
 | Internal Device Error      | SQLITE_IOERR           | Controller reset path       |
 
 ---
 
 ## 5. SQLite VFS Implementation
+
+**Implemented**: `kernel/src/vfs/sqlite_vfs.rs`, `kernel/src/storage/`
 
 ### 5.1 Overview
 
@@ -192,416 +156,82 @@ to LBA ranges on raw disk.
 
 ### 5.2 Block Allocator
 
-The first N blocks of the NVMe namespace contain a **superblock** and a
-**bitmap**:
+**Implemented**: `kernel/src/storage/block_alloc.rs`
 
 ```
-LBA 0:        Superblock (magic, version, block_size, total_blocks, bitmap_start, file_table_start)
+LBA 0:        Superblock (magic=0x0000_01_534F4E5648 "HVNOS", version, block_size, total_blocks)
 LBA 1..M:     Bitmap (1 bit per block: 0=free, 1=allocated)
-LBA M+1..M+K: File table (fixed entries: name[64], start_lba, length, flags)
+LBA M+1..M+K: File table (42 fixed entries)
 LBA M+K+1..:  Data blocks
 ```
 
-Block size = NVMe LBA size (typically 4096 bytes, queried from Identify Namespace).
-
-```rust
-struct BlockAllocator {
-    bitmap: DmaBuf,          // In-memory copy of on-disk bitmap
-    total_blocks: u64,
-    first_data_block: u64,
-    dirty: bool,             // Bitmap modified since last flush
-}
-
-impl BlockAllocator {
-    /// Allocate `count` contiguous blocks. Returns starting LBA.
-    fn alloc(&mut self, count: u64) -> Result<u64, AllocError>;
-
-    /// Free `count` blocks starting at `lba`.
-    fn free(&mut self, lba: u64, count: u64);
-
-    /// Grow a file's allocation by `additional` blocks, possibly relocating.
-    fn grow(&mut self, current_lba: u64, current_count: u64, additional: u64)
-        -> Result<u64, AllocError>;
-
-    /// Persist the bitmap to disk (called during xSync).
-    fn flush(&mut self, nvme: &mut NvmeDriver) -> Result<(), NvmeError>;
-}
-```
-
-**No fixed 90/10 partitioning.** The DB file, WAL file, journal, and temp
-files all allocate from the same pool. They grow and shrink dynamically.
+Operations: `format()` (blank disk), `load()` (existing disk), `alloc()`,
+`free()`, `grow()`, `flush()` (bitmap -> NVMe Flush).
 
 ### 5.3 File Table
 
-A small fixed-size table maps well-known names to LBA ranges:
+**Implemented**: `kernel/src/storage/file_table.rs`
 
-| Slot | Name           | Purpose                          |
-| ---- | -------------- | -------------------------------- |
-| 0    | `main.db`      | Primary SQLite database          |
-| 1    | `main.db-wal`  | WAL file                         |
-| 2    | `main.db-shm`  | Shared memory (WAL index)        |
-| 3    | `main.db-journal` | Rollback journal (non-WAL mode) |
-| 4-7  | `temp_N`       | Temp files for sort/materialize  |
+42 entries per 4 KiB block. Each entry:
+`{ name: [u8; 64], start_block: u64, block_count: u64, byte_length: u64, flags: u32 }`
 
-Each entry: `{ name: [u8; 64], start_lba: u64, block_count: u64, byte_length: u64, flags: u32 }`
+| Slot | Name              | Purpose                          |
+| ---- | ----------------- | -------------------------------- |
+| 0    | `main.db`         | Primary SQLite database          |
+| 1    | `main.db-wal`     | WAL file                         |
+| 2    | `main.db-shm`     | Shared memory (WAL index)        |
+| 3    | `main.db-journal` | Rollback journal                 |
+| 4-7  | `temp_N`          | Temp files for sort/materialize  |
 
-### 5.4 VFS Methods — The Complete Set
+### 5.4 VFS Methods
 
-#### xOpen
+All critical VFS methods are implemented:
 
-```rust
-fn xopen(vfs: *mut sqlite3_vfs, name: *const c_char, file: *mut sqlite3_file,
-         flags: c_int, out_flags: *mut c_int) -> c_int
-{
-    let filename = if name.is_null() {
-        // Temp file — allocate next free temp slot
-        allocate_temp_slot()
-    } else {
-        CStr::from_ptr(name)
-    };
+- **xOpen**: Look up or create file table entry
+- **xRead**: Non-aligned reads (full block DMA -> copy requested bytes)
+- **xWrite**: Aligned fast path (direct DMA) or Read-Modify-Write for
+  partial blocks
+- **xSync**: Bitmap flush + file table flush + **NVMe Flush** (ACID guarantee)
+- **xShmMap/Lock/Barrier/Unmap**: RAM-backed WAL index (trivial in
+  single-address-space kernel)
+- **xSleep**: TSC-calibrated busy-wait
+- **xCurrentTime**: Monotonic timestamp via TSC
+- **xRandomness**: RDRAND
 
-    let entry = file_table.lookup_or_create(filename, flags);
-    if entry.is_err() { return SQLITE_CANTOPEN; }
+**xSync is the most critical function.** Without the NVMe Flush command,
+ACID guarantees do not exist on power loss. The Flush command is the barrier
+that makes WAL commit durable.
 
-    // Store file handle state
-    (*file).start_lba = entry.start_lba;
-    (*file).block_count = entry.block_count;
-    (*file).byte_length = entry.byte_length;
+### 5.5 Block Cache
 
-    SQLITE_OK
-}
-```
+**Decision**: Omitted. SQLite's own page cache (1-4 MB) absorbs most
+repeated reads. A VFS-level LRU cache was planned in v1.0 but proved
+unnecessary given the QEMU/NVMe latency profile. Can be added later if
+profiling shows redundant NVMe reads on real hardware.
 
-#### xRead — Handling Non-Aligned Reads
-
-This is the critical path. SQLite reads arbitrary byte ranges.
-
-```rust
-fn xread(file: *mut sqlite3_file, buf: *mut c_void,
-         amount: c_int, offset: i64) -> c_int
-{
-    let amount = amount as usize;
-    let offset = offset as u64;
-
-    let block_size = BLOCK_SIZE as u64; // e.g., 4096
-    let start_block = offset / block_size;
-    let end_block = (offset + amount as u64 - 1) / block_size;
-    let block_count = end_block - start_block + 1;
-
-    let start_lba = file.start_lba + start_block;
-
-    // Check bounds
-    if start_block + block_count > file.block_count {
-        // SQLite spec: short reads fill remainder with zeros
-        // Read what we can, zero-fill the rest
-    }
-
-    // Allocate DMA buffer for full blocks
-    let dma = DmaBuf::alloc((block_count as usize) * BLOCK_SIZE)?;
-
-    // Issue NVMe read
-    let cmd = NvmeCommand::read(start_lba, block_count as u16 - 1, &dma);
-    nvme.submit_and_wait(cmd)?;
-
-    // Invalidate CPU cache (device wrote to RAM via DMA)
-    dma.invalidate_cache();
-
-    // Copy the requested byte range from the DMA buffer to SQLite's buffer.
-    // The offset within the first block:
-    let byte_offset_in_first_block = (offset % block_size) as usize;
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            dma.as_ptr().add(byte_offset_in_first_block),
-            buf as *mut u8,
-            amount,
-        );
-    }
-
-    SQLITE_OK
-}
-```
-
-**Key**: We always read full blocks from NVMe (hardware requirement), then
-copy the exact byte range SQLite asked for. No Read-Modify-Write for reads.
-
-#### xWrite — Read-Modify-Write for Partial Blocks
-
-```rust
-fn xwrite(file: *mut sqlite3_file, buf: *const c_void,
-          amount: c_int, offset: i64) -> c_int
-{
-    let amount = amount as usize;
-    let offset = offset as u64;
-
-    let block_size = BLOCK_SIZE as u64;
-    let start_block = offset / block_size;
-    let end_block = (offset + amount as u64 - 1) / block_size;
-    let block_count = end_block - start_block + 1;
-    let start_lba = file.start_lba + start_block;
-
-    // Grow file if needed
-    if start_block + block_count > file.block_count {
-        let extra = start_block + block_count - file.block_count;
-        allocator.grow(file.start_lba, file.block_count, extra)?;
-        file.block_count += extra;
-    }
-
-    let byte_offset_in_first_block = (offset % block_size) as usize;
-    let is_aligned = byte_offset_in_first_block == 0 && amount % BLOCK_SIZE == 0;
-
-    if is_aligned {
-        // Fast path: DMA directly from a copy of SQLite's data
-        let dma = DmaBuf::alloc(amount)?;
-        dma.copy_from_slice(buf, amount);
-        dma.flush_cache();
-        let cmd = NvmeCommand::write(start_lba, block_count as u16 - 1, &dma);
-        nvme.submit_and_wait(cmd)?;
-    } else {
-        // Slow path: Read-Modify-Write
-        let dma = DmaBuf::alloc((block_count as usize) * BLOCK_SIZE)?;
-
-        // 1. READ existing blocks from disk
-        let cmd = NvmeCommand::read(start_lba, block_count as u16 - 1, &dma);
-        nvme.submit_and_wait(cmd)?;
-        dma.invalidate_cache();
-
-        // 2. MODIFY: overlay SQLite's data onto the DMA buffer
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                buf as *const u8,
-                dma.as_mut_ptr().add(byte_offset_in_first_block),
-                amount,
-            );
-        }
-
-        // 3. WRITE the modified blocks back
-        dma.flush_cache();
-        let cmd = NvmeCommand::write(start_lba, block_count as u16 - 1, &dma);
-        nvme.submit_and_wait(cmd)?;
-    }
-
-    // Update file byte length
-    let new_end = offset + amount as u64;
-    if new_end > file.byte_length {
-        file.byte_length = new_end;
-    }
-
-    SQLITE_OK
-}
-```
-
-#### xSync — The ACID Guarantee
-
-**This is the most critical function in the entire VFS.**
-
-```rust
-fn xsync(file: *mut sqlite3_file, flags: c_int) -> c_int
-{
-    // 1. Flush the block allocator bitmap if dirty
-    if allocator.dirty {
-        allocator.flush(&mut nvme)?;
-    }
-
-    // 2. Flush the file table metadata
-    file_table.flush(&mut nvme)?;
-
-    // 3. Issue NVMe Flush command — forces all written data from the
-    //    device's volatile write cache to non-volatile storage.
-    let cmd = NvmeCommand {
-        opcode: 0x00, // Flush
-        nsid: 1,
-        ..Default::default()
-    };
-    let result = nvme.submit_and_wait(cmd);
-
-    match result {
-        Ok(()) => SQLITE_OK,
-        Err(_) => SQLITE_IOERR_FSYNC,
-    }
-}
-```
-
-**Without this NVMe Flush command, ACID guarantees do not exist on power loss.**
-The device's volatile write cache may reorder or lose writes. The Flush
-command is the barrier that makes WAL commit durable.
-
-#### xShmMap, xShmLock, xShmBarrier, xShmUnmap — WAL Shared Memory
-
-In WAL mode, SQLite uses shared memory to coordinate readers and the writer.
-The `-shm` file contains the WAL index (a hash table of page numbers).
-
-**In our single-address-space bare-metal kernel**, this is straightforward:
-
-```rust
-// The shm region is a kernel-allocated buffer, shared by reference.
-// No mmap, no VMA — just a pointer.
-static SHM_REGION: Mutex<Option<ShmState>> = Mutex::new(None);
-
-struct ShmState {
-    regions: Vec<(*mut u8, usize)>, // Up to SQLITE_SHM_NLOCK regions
-    locks: [ShmLockState; SQLITE_SHM_NLOCK],
-}
-
-fn xshmmap(file: *mut sqlite3_file, region: c_int, region_size: c_int,
-           extend: c_int, pp: *mut *mut c_void) -> c_int
-{
-    let mut shm = SHM_REGION.lock();
-    let shm = shm.get_or_insert_with(ShmState::new);
-
-    let idx = region as usize;
-
-    // Extend if needed
-    while shm.regions.len() <= idx {
-        let buf = alloc::alloc(Layout::from_size_align(region_size as usize, 4096).unwrap());
-        buf.write_bytes(0, region_size as usize);
-        shm.regions.push((buf, region_size as usize));
-    }
-
-    *pp = shm.regions[idx].0 as *mut c_void;
-    SQLITE_OK
-}
-
-fn xshmlock(file: *mut sqlite3_file, offset: c_int, n: c_int, flags: c_int) -> c_int
-{
-    let mut shm = SHM_REGION.lock();
-    let shm = shm.as_mut().unwrap();
-
-    // In single-process bare-metal: if we ever support multiple threads
-    // accessing SQLite concurrently, implement reader/writer locks here.
-    // For single-threaded use: always succeed.
-    // For multi-threaded use:
-    for i in offset..(offset + n) {
-        let lock = &mut shm.locks[i as usize];
-        if flags & SQLITE_SHM_LOCK != 0 {
-            if flags & SQLITE_SHM_EXCLUSIVE != 0 {
-                if !lock.try_exclusive() { return SQLITE_BUSY; }
-            } else {
-                if !lock.try_shared() { return SQLITE_BUSY; }
-            }
-        } else {
-            lock.release();
-        }
-    }
-    SQLITE_OK
-}
-
-fn xshmbarrier(_file: *mut sqlite3_file) {
-    // Memory barrier — ensures all writes to shm are visible to other threads.
-    core::sync::atomic::fence(Ordering::SeqCst);
-}
-
-fn xshmunmap(file: *mut sqlite3_file, delete_flag: c_int) -> c_int {
-    if delete_flag != 0 {
-        let mut shm = SHM_REGION.lock();
-        if let Some(state) = shm.take() {
-            for (ptr, size) in state.regions {
-                alloc::dealloc(ptr, Layout::from_size_align(size, 4096).unwrap());
-            }
-        }
-    }
-    SQLITE_OK
-}
-```
-
-**Key insight**: In a single-address-space OS, xShm is trivial — just
-allocate RAM and hand out pointers. No page table manipulation needed.
-If HeavenOS later adds process isolation, this becomes a `map_shared_pages()`
-call in the page table code.
-
-#### xSleep — Requires Timer Hardware
-
-```rust
-fn xsleep(_vfs: *mut sqlite3_vfs, microseconds: c_int) -> c_int {
-    // Use APIC timer or HPET to sleep for the requested duration.
-    // Cannot just yield — SQLite expects an actual time delay.
-    timer::sleep_us(microseconds as u64);
-    microseconds
-}
-```
-
-The timer subsystem must be initialized during boot (calibrate TSC or
-program APIC timer frequency).
-
-#### xCurrentTime / xCurrentTimeInt64
-
-```rust
-fn xcurrenttime64(_vfs: *mut sqlite3_vfs, time: *mut i64) -> c_int {
-    // Julian day number in milliseconds since noon on Nov 24, 4714 BC.
-    // Read TSC or RTC, convert to Unix timestamp, then to Julian.
-    let unix_ms = rtc::read_unix_time_ms();
-    let julian_ms = unix_ms + 210866760000000_i64; // Unix epoch in Julian ms
-    *time = julian_ms;
-    SQLITE_OK
-}
-```
-
-Requires an RTC driver (CMOS RTC on x86) or NTP-synced time source.
-
-#### xRandomness
-
-```rust
-fn xrandomness(_vfs: *mut sqlite3_vfs, n: c_int, buf: *mut c_char) -> c_int {
-    // Use RDRAND/RDSEED on modern x86, or a CSPRNG seeded from TSC jitter.
-    for i in 0..n {
-        *buf.add(i as usize) = rdrand_u8() as c_char;
-    }
-    n
-}
-```
-
-### 5.5 Bootstrap Sequence
-
-When the NVMe device is blank (no superblock magic):
+### 5.6 Bootstrap Sequence
 
 ```
-1. Read LBA 0 → check magic bytes
+1. Read LBA 0 -> check magic bytes
 2. If no magic:
-   a. Query NVMe Identify Namespace → get LBA size, capacity
-   b. Compute bitmap size = ceil(total_blocks / 8)
-   c. Compute file table size = FILE_TABLE_ENTRIES * ENTRY_SIZE
-   d. Write superblock to LBA 0
-   e. Write zeroed bitmap to LBA 1..M (mark system LBAs as allocated)
-   f. Write zeroed file table to LBA M+1..M+K
+   a. Query NVMe Identify Namespace -> LBA size, capacity
+   b. Write superblock, zeroed bitmap, zeroed file table
+   c. NVMe Flush
+   d. Open SQLite -> creates main.db
+   e. CREATE TABLE namespace (path, type, content, mode, mtime)
+   f. CREATE TABLE audit (id, ts, level, agent, action, target, detail)
    g. NVMe Flush
-   h. Open SQLite on the fresh allocator → creates main.db
-   i. Execute schema DDL (CREATE TABLE for Styx metadata, etc.)
-   j. NVMe Flush
 3. If magic present:
-   a. Read superblock → validate version, block_size
-   b. Read bitmap into RAM
-   c. Read file table into RAM
-   d. Open SQLite → WAL recovery happens automatically
+   a. Read superblock, validate version
+   b. Read bitmap + file table into RAM
+   c. Open SQLite -> WAL recovery happens automatically
 ```
-
-### 5.6 Block Cache
-
-The VFS maintains a small LRU block cache to avoid redundant NVMe reads:
-
-```rust
-struct BlockCache {
-    entries: BTreeMap<u64, CacheEntry>, // LBA → cached block
-    lru: VecDeque<u64>,                 // LBA eviction order
-    capacity: usize,                    // Max cached blocks (e.g., 256 = 1 MB)
-}
-
-struct CacheEntry {
-    data: [u8; BLOCK_SIZE],
-    dirty: bool,
-}
-```
-
-SQLite already has its own page cache, so this is a small L2 to absorb
-repeated reads to the same blocks (especially file table, bitmap, and
-WAL index pages). Dirty cache entries are flushed on xSync.
-
-**This partially replaces the Linux page cache** we gave up by going
-bare metal. The tradeoff is explicit: we control exactly what's cached,
-but we lose the kernel's LRU sophistication. For an embedded system
-with predictable access patterns, this is acceptable.
 
 ---
 
 ## 6. SQLite Compilation for Bare Metal
+
+**Implemented**: `kernel/src/sqlite/` (mod.rs, ffi.rs, vfs_bridge.rs)
 
 SQLite is compiled as a single C file (`sqlite3.c`) with:
 
@@ -609,364 +239,493 @@ SQLite is compiled as a single C file (`sqlite3.c`) with:
 CFLAGS += -DSQLITE_OS_OTHER=1          # Disable all built-in VFS
 CFLAGS += -DSQLITE_OMIT_WAL=0          # Keep WAL support
 CFLAGS += -DSQLITE_OMIT_LOAD_EXTENSION # No dlopen
-CFLAGS += -DSQLITE_THREADSAFE=0        # Single-threaded (for now)
+CFLAGS += -DSQLITE_THREADSAFE=0        # Single-threaded
 CFLAGS += -DSQLITE_TEMP_STORE=2        # Temp tables in memory
 CFLAGS += -DSQLITE_DEFAULT_MEMSTATUS=0 # Disable memory tracking
-CFLAGS += -nostdlib -ffreestanding      # No libc
-CFLAGS += -target x86_64-unknown-none  # Bare metal target
+CFLAGS += -nostdlib -ffreestanding
 ```
 
-Required libc shims (minimal):
-- `memcpy`, `memset`, `memmove`, `memcmp` — from `compiler_builtins` or hand-written
-- `strlen`, `strcmp` — trivial implementations
-- `malloc`, `free`, `realloc` — routed to our kernel allocator via `SQLITE_CONFIG_MALLOC`
+Required libc shims: `memcpy`, `memset`, `memmove`, `memcmp`, `strlen`,
+`strcmp` (from `compiler_builtins`), plus `malloc`/`free`/`realloc` routed
+to the kernel allocator via `SQLITE_CONFIG_MALLOC`.
 
-We do NOT need: `open`, `close`, `read`, `write`, `fstat`, `fcntl`,
-`mmap`, `munmap`, `dlopen`, `getpid`, `sleep`, `gettimeofday` — these
-are all replaced by VFS methods.
-
-### 6.1 Custom Malloc
+### 6.1 Public API
 
 ```rust
-#[no_mangle]
-pub extern "C" fn heavenos_malloc(n: c_int) -> *mut c_void {
-    alloc::alloc(Layout::from_size_align(n as usize, 8).unwrap()) as *mut c_void
-}
+pub static DB: Mutex<Option<SqliteDb>> = Mutex::new(None);
 
-#[no_mangle]
-pub extern "C" fn heavenos_free(ptr: *mut c_void) {
-    // We need size tracking — use a header or a slab allocator
-    // that can determine size from the pointer.
-    slab_allocator::dealloc(ptr as *mut u8);
+impl SqliteDb {
+    pub fn open(name: &str) -> Result<Self, String>;
+    pub fn exec(&self, sql: &str) -> Result<(), String>;
+    pub fn query(&self, sql: &str) -> Result<QueryResult, String>;
+    pub fn query_value(&self, sql: &str) -> Result<Option<String>, String>;
+    pub fn query_column(&self, sql: &str) -> Result<Vec<String>, String>;
 }
-
-#[no_mangle]
-pub extern "C" fn heavenos_realloc(ptr: *mut c_void, n: c_int) -> *mut c_void {
-    slab_allocator::realloc(ptr as *mut u8, n as usize) as *mut c_void
-}
-
-// Registered at init:
-// sqlite3_config(SQLITE_CONFIG_MALLOC, &methods);
 ```
-
-**Note**: `sqlite3_free()` calls `xFree(ptr)` with no size argument.
-Our allocator must be able to determine the allocation size from the
-pointer alone (slab allocator, or size stored in a header before the
-returned pointer).
 
 ---
 
-## 7. Styx (9P2000) Namespace
+## 7. Namespace
 
-### 7.1 How SQLite State Becomes a File Tree
+**Implemented**: `kernel/src/fs/styx/` + `kernel/src/shell/commands.rs`
+
+### 7.1 Design Change from v1.0
+
+The original plan called for a full Styx (9P2000) protocol server with
+synthetic files. The actual implementation uses a **hybrid approach**:
+
+- **SQLite `namespace` table** stores all persistent namespace entries
+  (path, type, content, mtime). This is the source of truth.
+- **Shell commands** (`ls`, `cat`, `sql`) provide direct access.
+- **Lua builtins** (`read()`, `write()`, `ls()`, `sql()`) provide
+  programmatic access.
+- **Agent tools** (`read_file`, `write_file`, `list_dir`, `sql_query`,
+  `str_replace`) expose the same operations to Claude via tool_use.
+- The Styx 9P2000 message parser exists for future TCP transport.
+
+### 7.2 Namespace Layout
 
 ```
 /                           (root)
-├── db/                     (direct SQL interface)
-│   ├── ctl                 (write SQL, read results)
-│   └── schema              (read: current schema DDL)
-├── agents/                 (per-agent state)
-│   ├── agent-001/
-│   │   ├── status          (read: running/idle/error)
-│   │   ├── config          (read/write: JSON config)
-│   │   ├── log             (read: tail of agent log)
-│   │   └── ctl             (write: start/stop/restart)
-│   └── agent-002/
-│       └── ...
-├── hw/                     (hardware state)
-│   ├── nvme/
-│   │   ├── info            (read: model, capacity, temperature)
-│   │   ├── smart           (read: SMART attributes)
-│   │   └── stats           (read: IOPS, latency histogram)
-│   └── gpu/
-│       ├── info            (read: model, VRAM, clocks)
-│       ├── ctl             (write: config commands)
-│       ├── stats           (read: utilization, temperature)
-│       └── compute/        (see Section 8)
-├── sys/                    (system metadata)
-│   ├── uptime              (read)
-│   ├── meminfo             (read)
-│   └── log                 (read: kernel log ring buffer)
-└── net/                    (network stack)
-    └── ...                 (Styx-over-TCP for remote access)
++-- db/                     (direct SQL interface)
+|   +-- ctl                 (sql command: exec_and_format)
+|   +-- schema              (SELECT sql FROM sqlite_master)
++-- agents/                 (Lua scripts stored in namespace table)
+|   +-- indexer             (content = Lua source code)
+|   +-- monitor
+|   +-- ...
++-- hw/                     (hardware state, synthetic)
+|   +-- nvme/
+|       +-- info            (NVMe controller info)
++-- sys/                    (system metadata, synthetic)
+|   +-- uptime              (monotonic uptime)
+|   +-- meminfo             (physical memory stats)
 ```
 
-### 7.2 The /db/ctl Interface
+### 7.3 Access Paths
 
-```
-$ echo "SELECT name FROM agents WHERE status='running'" > /db/ctl
-$ cat /db/ctl
-agent-001
-agent-003
-```
-
-Implementation: the Styx server intercepts writes to `/db/ctl`, executes
-them as SQL on the embedded SQLite instance, and buffers the result for
-the next read. This is the **only** path for ad-hoc queries. Structured
-agent access should use the typed paths under `/agents/`.
-
-### 7.3 Synthetic Files
-
-Most files under `/agents/` and `/hw/` are **synthetic** — generated on
-read from SQLite queries or hardware register reads. They don't correspond
-to disk blocks. The Styx server translates `Tread` into a query and
-formats the result as a byte stream.
+| Access Method    | Read                        | Write                        |
+| ---------------- | --------------------------- | ---------------------------- |
+| Shell            | `cat /agents/indexer`       | `store /agents/indexer <code>` |
+| Lua              | `read("/agents/indexer")`   | `write("/agents/indexer", code)` |
+| Agent (Claude)   | tool: `read_file`           | tool: `write_file` / `str_replace` |
+| SQL              | `sql SELECT ...`            | `sql INSERT ...` (REPL only) |
 
 ---
 
-## 8. GPU Integration — Control Plane vs Data Plane
+## 8. Network Stack
 
-### 8.1 What Does NOT Go Through Files
+**Implemented**: `kernel/src/net/` + `kernel/src/drivers/virtio/`
 
-- Model weights (GB)
-- Activation tensors (hundreds of MB)
-- KV cache (hundreds of MB per inference context)
-- Intermediate compute results between GPU kernel launches
+Not in the original v1.0 plan. Added to enable Claude API access.
 
-These reside in **VRAM** and move via **DMA between system RAM and VRAM**,
-never through SQLite, never through Styx.
-
-### 8.2 What Goes Through Files (Control Plane)
-
-- Model selection: `echo "load mistral-7b" > /hw/gpu/compute/ctl`
-- Inference request: `echo '{"prompt":"hello","max_tokens":128}' > /hw/gpu/compute/ctl`
-- Status: `cat /hw/gpu/compute/status` → `"generating token 42/128"`
-- Result: `cat /hw/gpu/compute/result` → `"Hello! How can I help you?"`
-
-### 8.3 The Actual GPU Data Path
+### 8.1 Architecture
 
 ```
-                    Control Plane (Styx)          Data Plane (shared memory + DMA)
-                    ────────────────────          ──────────────────────────────────
-
-Agent writes       "load model X"                 Kernel reads model weights from
-to /gpu/ctl  ───────────────────────►             NVMe → DMA to system RAM → DMA
-                                                  to VRAM via PCIe BAR/IOMMU
-                                                        │
-Agent writes       "infer: prompt"                      │
-to /gpu/ctl  ───────────────────────►             Tokenize prompt, DMA token IDs
-                                                  to VRAM input buffer
-                                                        │
-                                                  GPU executes attention layers,
-                                                  MLP, softmax — thousands of
-                                                  kernel launches, all in VRAM
-                                                        │
-                                                  Output token DMA'd back to RAM
-                                                        │
-Agent reads        "generated text"               ◄─────┘
-from /gpu/result ◄───────────────────
++------------------------------------------------------+
+|  Claude API Client (api/)                            |
+|    TLS 1.3 (embedded-tls, AES-128-GCM, P-256)       |
++------------------------------------------------------+
+|  TCP / UDP sockets (smoltcp)                         |
++------------------------------------------------------+
+|  IP: 10.0.2.15  GW: 10.0.2.2  DNS: 10.0.2.3        |
++------------------------------------------------------+
+|  virtio-net driver (drivers/virtio/net.rs)           |
+|    DMA ring buffers, MAC address from device config  |
++------------------------------------------------------+
+|  QEMU user-mode networking (-netdev user)            |
++------------------------------------------------------+
 ```
 
-### 8.4 GPU BAR Mapping — Limitations
+### 8.2 DNS Resolver
 
-The GPU exposes VRAM through BAR0 (Base Address Register 0) on PCIe.
-Typical constraints:
+**Implemented**: `kernel/src/net/dns.rs`
 
-- **BAR0 window is often 256 MB** even on GPUs with 8+ GB VRAM
-- The kernel maps BAR0 into its virtual address space during PCI enumeration
-- For VRAM access beyond the BAR window: use **GPU-side DMA engines**
-  (the GPU copies data between visible and non-visible VRAM regions)
-- CPU writes to BAR-mapped VRAM are **uncacheable** (mapped as UC or WC
-  in page tables) — no CPU cache coherence issues, but writes are slow
-  (~1-2 GB/s vs ~30 GB/s for cached RAM)
+RFC 1035 A-record queries over UDP to QEMU's DNS forwarder (10.0.2.3).
+8-entry cache with TTL (capped at 5 min), proper oldest-entry eviction.
+Handles compression pointers.
 
-**Correct approach**: Use CPU→VRAM only for small control data.
-For bulk transfers, use the GPU's DMA engine or the host-side IOMMU
-to DMA from system RAM to VRAM without CPU involvement.
+### 8.3 TLS 1.3
 
-### 8.5 The Inference Engine is Kernel Code
+**Implemented**: `kernel/src/crypto/`
 
-The GPU compute pipeline (shader compilation, command buffer management,
-descriptor sets, queue submission, fence synchronization) runs in **kernel
-space as a Rust driver**. It is not abstracted behind files.
+- **embedded-tls** 0.18: In-kernel TLS 1.3 with AES-128-GCM + P-256
+- **RDRAND RNG**: Hardware random via `RdRandRng` (implements `CryptoRng`)
+- **DER parser**: `kernel/src/crypto/der.rs` — X.509 certificate parsing
+- **SPKI pin infrastructure**: SHA-256 hash of server public key, runtime
+  set/clear via `pin set <hex>` / `pin clear` shell commands
 
-An agent that wants to run inference sends a control message via Styx.
-The kernel's inference driver does the actual work:
+**Known limitation**: `ENFORCE_PINNING = false` because embedded-tls 0.18
+marks `CertificateRef.entries` as `pub(crate)`, preventing external
+certificate inspection. The complete infrastructure (DER parser, SHA-256
+via `sha2` crate, shell commands) is ready and waiting for the library
+to expose the certificate chain.
 
-```rust
-pub struct InferenceDriver {
-    gpu: GpuDriver,
-    models: BTreeMap<String, LoadedModel>,
-}
+---
 
-pub struct LoadedModel {
-    weights_vram: VramAllocation,
-    kv_cache: VramAllocation,
-    config: ModelConfig,
-}
+## 9. Claude API Client
 
-impl InferenceDriver {
-    /// Load model weights from NVMe to VRAM.
-    pub fn load_model(&mut self, name: &str) -> Result<(), InferenceError>;
+**Implemented**: `kernel/src/api/` (mod.rs, http.rs, json.rs, tools.rs)
 
-    /// Run inference. Returns generated tokens.
-    pub fn infer(&mut self, model: &str, prompt: &[u32], params: InferenceParams)
-        -> Result<Vec<u32>, InferenceError>;
-}
+### 9.1 Two Modes
+
+| Mode      | Path                   | Use Case                    |
+| --------- | ---------------------- | --------------------------- |
+| **TLS**   | Direct HTTPS :443      | Production (auto DNS)       |
+| **Proxy** | Plain HTTP :8080       | Debug (socat on host)       |
+
+### 9.2 SSE Streaming Parser
+
+The API uses Server-Sent Events. The parser handles:
+
+- `content_block_start` (type: `text` or `tool_use`) — captures tool id/name
+- `content_block_delta` (type: `text_delta` or `input_json_delta`) —
+  streams text to COM1, accumulates tool input JSON
+- `content_block_stop` — finalizes tool call
+- `message_delta` — captures `stop_reason` (`end_turn` or `tool_use`)
+- `message_stop` — signals end of response
+
+### 9.3 JSON Parser
+
+**Implemented**: `kernel/src/api/json.rs`
+
+Recursive descent, no_std, no external deps. Handles:
+- Full JSON spec (null, bool, number, string, array, object)
+- UTF-16 surrogate pairs in `\uXXXX` escapes
+- Multi-byte UTF-8 passthrough (2/3/4-byte sequences)
+- Custom `parse_f64` for no_std environments
+
+### 9.4 Retry Logic
+
+- 3 retries with exponential backoff (1s, 2s, 4s)
+- Honors `Retry-After` header on 429 (capped at 60s)
+- Retries on 429/500/529; fails immediately on 401/403/404
+- CRLF injection prevention on api_key and model strings
+
+---
+
+## 10. Agentic Loop
+
+**Implemented**: `kernel/src/shell/agent.rs` + `kernel/src/api/tools.rs`
+
+### 10.1 Architecture
+
+```
+COM1 terminal (operator)
+    | "agent refactore l'indexer"
+    v
+Shell dispatch -> run_agent_loop()
+    |
+    v
+loop (max 20 turns):
+    |
+    +-- Build HTTP request with tools + conversation history
+    +-- TLS handshake -> api.anthropic.com:443
+    +-- Send Messages API request (stream=true, tools=[...])
+    +-- Parse SSE stream:
+    |     text_delta -> print to COM1
+    |     tool_use   -> accumulate input JSON
+    |     message_stop -> check stop_reason
+    |
+    +-- If stop_reason == "end_turn": print final text, return
+    +-- If stop_reason == "tool_use":
+          +-- For each tool call:
+          |     dispatch_tool(name, input_json)
+          |       -> read_file:   SELECT content FROM namespace
+          |       -> write_file:  INSERT OR REPLACE INTO namespace
+          |       -> sql_query:   exec_and_format (read-only)
+          |       -> list_dir:    SELECT path FROM namespace WHERE substr(...)
+          |       -> str_replace: read + replacen + UPDATE
+          +-- Append assistant message (tool_use blocks) to history
+          +-- Append user message (tool_result blocks) to history
+          +-- Continue loop
+```
+
+### 10.2 Tool Definitions
+
+5 tools exposed to Claude with JSON Schema:
+
+| Tool          | Description                                    |
+| ------------- | ---------------------------------------------- |
+| `read_file`   | Read file from namespace (path -> content)     |
+| `write_file`  | Write/create file in namespace                 |
+| `sql_query`   | Read-only SQL (SELECT/EXPLAIN/PRAGMA only)     |
+| `list_dir`    | List namespace entries under a prefix           |
+| `str_replace` | Find-and-replace in a file (first occurrence)  |
+
+### 10.3 Security
+
+- SQL queries from tools are restricted to SELECT/EXPLAIN/PRAGMA
+  (case-insensitive check)
+- `ls()` uses `substr()` instead of `LIKE` to prevent wildcard injection
+- Tool results are truncated in display (200 chars) but sent in full to API
+- Rate limiting on Lua `ask()`: 10s minimum between calls
+- max_tokens set to 4096 for tool-use requests
+
+### 10.4 Conversation Format
+
+Messages use the Anthropic Messages API format with structured content blocks:
+
+```json
+// Assistant message with tool calls:
+{"role": "assistant", "content": [
+  {"type": "text", "text": "Let me read that file."},
+  {"type": "tool_use", "id": "toolu_01...", "name": "read_file",
+   "input": {"path": "/agents/indexer"}}
+]}
+
+// User message with tool results:
+{"role": "user", "content": [
+  {"type": "tool_result", "tool_use_id": "toolu_01...",
+   "content": "local db = sql(...)"}
+]}
 ```
 
 ---
 
-## 9. WASM Agent Sandbox (Future)
+## 11. Lua Agent Runtime
 
-### 9.1 Realistic Assessment
+**Implemented**: `kernel/src/lua/` (mod.rs, ffi.rs, alloc.rs, builtins.rs, repl.rs)
 
-| Option           | Maturity  | Speed       | no_std    | Verdict                           |
-| ---------------- | --------- | ----------- | --------- | --------------------------------- |
-| wasmtime         | High      | JIT (fast)  | No        | Requires OS-level porting effort  |
-| wasmi            | Medium    | Interpreter | Yes       | 10-50x slower, but works today    |
-| wasm3            | Medium    | Interpreter | Yes       | Fastest interpreter, C-based      |
-| Custom JIT       | N/A       | JIT (fast)  | Yes       | Months of work                    |
+### 11.1 Design Change from v1.0
 
-### 9.2 Recommended Path
+The original plan called for WASM sandboxes (wasmi). The actual
+implementation uses **Lua 5.5.0** compiled to bare metal:
 
-**Phase 1**: Use `wasmi` (pure Rust, `no_std`). Accept the performance
-penalty for agent orchestration logic (which is not compute-heavy).
+| Aspect         | WASM (planned)           | Lua (actual)               |
+| -------------- | ------------------------ | -------------------------- |
+| Isolation      | Linear memory sandbox    | Memory-limited allocator   |
+| Language       | Any -> WASM              | Lua only                   |
+| Performance    | Interpreter (wasmi)      | Interpreter (Lua VM)       |
+| Integration    | Host function ABI        | Direct FFI to kernel       |
+| Complexity     | ~months of work          | ~days of work              |
 
-**Phase 2**: Port wasm3 (C) to bare metal — it's smaller than wasmtime
-and designed for embedded use.
+The tradeoff is acceptable: Lua agents are not sandboxed against malicious
+code (they run in kernel space), but they are resource-limited and have
+read-only SQL access.
 
-**Phase 3**: If JIT performance is needed, investigate cranelift-jit
-isolation (the codegen backend is separable from wasmtime's runtime).
+### 11.2 Builtins
 
-### 9.3 What Agents Can Do
+| Function                | Description                              |
+| ----------------------- | ---------------------------------------- |
+| `sql(query, ...)`       | Execute SQL (read-only for agents)       |
+| `read(path)`            | Read file from namespace                 |
+| `write(path, data)`     | Write file to namespace                  |
+| `ls(path)`              | List namespace entries                   |
+| `log(msg)`              | Print to serial console                  |
+| `sleep(ms)`             | TSC-based delay (max 60s)                |
+| `now()`                 | Monotonic timestamp (ms)                 |
+| `audit(level, action)`  | Write to audit table                     |
+| `ask(prompt)` / `ask(table)` | Call Claude API (10s rate limit)    |
 
-Agents run in WASM and communicate with the kernel through **host functions**,
-NOT through emulated WASI filesystem calls:
+### 11.3 Execution Model
 
-```rust
-// Host functions exposed to WASM agents:
-extern "C" {
-    /// Send a Styx message. Returns response bytes.
-    fn styx_request(msg_ptr: *const u8, msg_len: u32,
-                    resp_ptr: *mut u8, resp_cap: u32) -> i32;
-
-    /// Request inference on a loaded model.
-    fn inference_request(prompt_ptr: *const u8, prompt_len: u32,
-                         params_ptr: *const u8, params_len: u32,
-                         result_ptr: *mut u8, result_cap: u32) -> i32;
-
-    /// Log a message to the kernel log.
-    fn log(level: u32, msg_ptr: *const u8, msg_len: u32);
-}
-```
-
-This avoids the WASI compatibility problem entirely. We don't pretend
-WASM agents are POSIX programs. They're sandboxed plugins with a
-well-defined kernel ABI.
-
-### 9.4 Memory Budget
-
-| Component            | Estimate      | Notes                            |
-| -------------------- | ------------- | -------------------------------- |
-| Kernel + drivers     | 16-32 MB      | Rust binary, page tables, stacks |
-| SQLite instance       | 2-8 MB        | Page cache + WAL                 |
-| Block cache          | 1-4 MB        | 256-1024 cached blocks           |
-| WASM runtime (wasmi) | 1-2 MB        | Per-module overhead              |
-| WASM agent memory    | 4-16 MB each  | Linear memory per agent          |
-| × 4 agents           | 16-64 MB      |                                  |
-| GPU VRAM             | Separate      | Not counted in system RAM        |
-| **Total RAM**        | **~64-128 MB** | Fits in 512 MB with headroom    |
+- **Agent mode** (`run /agents/foo`): Load Lua from namespace table, execute
+  with 30s timeout, read-only SQL, audit logging
+- **REPL mode** (`lua`): Interactive, no timeout, full SQL access
+- **Memory limit**: Configurable per agent (default 16 MiB)
+- **GC**: Incremental mode (pause=100, stepmul=200, stepsize=10)
 
 ---
 
-## 10. Concurrency Model
+## 12. Shell Interface
 
-### 10.1 Phase 1 — Single-Threaded Cooperative
+**Implemented**: `kernel/src/shell/` (mod.rs, commands.rs, agent.rs, line.rs)
 
-- One main loop: poll NVMe completions, service Styx requests, run
-  WASM agent steps (cooperative yield points in the interpreter)
-- SQLite is `THREADSAFE=0` — no mutexes needed
+```
+heaven% help
+HeavenOS shell commands:
+
+  help          show this help
+  mem           physical memory info
+  nvme          NVMe controller info
+  net           network interface info
+  cpu           CPU features
+  uptime        system uptime
+  ls [path]     list namespace entries
+  cat <path>    read a namespace file
+  echo <text>   print text
+  sql <stmt>    execute SQL on the system database
+
+Lua:
+  lua             interactive Lua REPL
+  run <path>      execute a Lua agent from namespace
+  store <p> <c>   store Lua script at path
+
+Claude API:
+  apikey <key>     set Anthropic API key
+  resolve <ip>     set api.anthropic.com IP (override DNS)
+  ask <prompt>     send message via TLS (auto-resolves DNS)
+  askp <prompt>    send message via proxy (plain HTTP)
+  agent <prompt>   agentic loop with tool use (read/write/sql)
+  agentp <prompt>  agentic loop via proxy
+  model <name>     set model (default: claude-sonnet-4-6-20250514)
+  pin [show|set]   manage TLS certificate SPKI pin
+```
+
+Line editor supports backspace, Ctrl-C (cancel), Ctrl-U (clear line).
+
+---
+
+## 13. Concurrency Model
+
+### Current: Single-Threaded Cooperative
+
+- One main loop: shell prompt -> command dispatch -> return
+- SQLite is `THREADSAFE=0` -- no mutexes needed
+- Network polling is synchronous (spin-loop during API calls)
 - `xShmLock` always succeeds (single accessor)
 
-### 10.2 Phase 2 — Multi-Core
+### Future: Multi-Core
 
 - One NVMe I/O queue pair per core
-- SQLite access serialized through a spinlock or ticket lock
+- SQLite access serialized through spinlock
 - `THREADSAFE=1`, VFS locking becomes real
-- WASM agents pinned to cores, communicate via message queues
+- Agents pinned to cores
 
 ---
 
-## 11. Implementation Order
+## 14. Implementation Status
 
 ```
-Phase 0: Boot + Memory                    [Weeks 1-4]
-  ├── UEFI bootloader → long mode
-  ├── Physical page allocator (bitmap)
-  ├── Kernel heap (slab allocator)
-  ├── APIC timer + TSC calibration
-  └── Serial console for debug output
+Phase 0: Boot + Memory                    [DONE]
+  +-- Limine bootloader -> long mode
+  +-- Physical page allocator (bitmap, 4KiB pages, up to 4 GiB)
+  +-- DMA-safe allocator (clflushopt + mfence)
+  +-- APIC timer + TSC calibration
+  +-- GDT, PIC, IDT
+  +-- Serial console (COM1)
 
-Phase 1: NVMe Driver                      [Weeks 5-8]
-  ├── PCIe enumeration (find NVMe controller)
-  ├── Admin queue setup
-  ├── I/O queue pair setup
-  ├── Read/Write/Flush commands
-  ├── DMA buffer allocator
-  └── Error handling + timeout
+Phase 1: NVMe Driver                      [DONE]
+  +-- PCI enumeration (find NVMe by class 01:08)
+  +-- Admin queue setup (Identify Controller/Namespace)
+  +-- I/O queue pair (Create CQ + SQ)
+  +-- Read/Write/Flush with PRP lists
+  +-- Auto-chunking for >65535 blocks
+  +-- 30s TSC-based timeout
 
-Phase 2: SQLite VFS                        [Weeks 9-14]
-  ├── Block allocator (bitmap on disk)
-  ├── File table
-  ├── Compile sqlite3.c for bare metal
-  ├── libc shims (memcpy, malloc, etc.)
-  ├── VFS: xOpen, xClose, xDelete
-  ├── VFS: xRead (non-aligned), xWrite (RMW)
-  ├── VFS: xSync (NVMe Flush)
-  ├── VFS: xShmMap/Lock/Barrier/Unmap
-  ├── VFS: xSleep, xCurrentTime, xRandomness
-  ├── Bootstrap (blank disk → initialized DB)
-  ├── Block cache
-  └── Crash recovery testing
+Phase 2: SQLite VFS                        [DONE]
+  +-- Block allocator (superblock + bitmap on disk)
+  +-- File table (42 entries)
+  +-- sqlite3.c compiled for bare metal (SQLITE_OS_OTHER=1)
+  +-- libc shims (compiler_builtins + custom malloc)
+  +-- VFS: xOpen, xClose, xDelete
+  +-- VFS: xRead (non-aligned DMA), xWrite (RMW)
+  +-- VFS: xSync (bitmap + file table + NVMe Flush)
+  +-- VFS: xShmMap/Lock/Barrier/Unmap (RAM-backed)
+  +-- VFS: xSleep (TSC), xCurrentTime, xRandomness (RDRAND)
+  +-- Bootstrap (blank disk -> schema DDL)
+  +-- [Block cache: omitted, SQLite page cache sufficient]
 
-Phase 3: Styx Server                       [Weeks 15-18]
-  ├── 9P2000 message parsing
-  ├── Synthetic file tree
-  ├── /db/ctl SQL interface
-  ├── /hw/* hardware info files
-  └── TCP transport (Styx-over-TCP)
+Phase 3: Namespace                         [DONE]
+  +-- Styx 9P2000 message parser
+  +-- SQLite namespace table (path, type, content, mtime)
+  +-- SQLite audit table (agent, action, target)
+  +-- Shell: ls, cat, sql, store
+  +-- Lua builtins: read, write, ls, sql
 
-Phase 4: GPU Driver                        [Weeks 19-24]
-  ├── PCI enumeration for GPU
-  ├── BAR0 mapping
-  ├── Command buffer / queue submission
-  ├── Simple compute shader test
-  ├── DMA: RAM ↔ VRAM
-  └── Inference driver skeleton
+Phase 4: Network + TLS + Claude API        [DONE]
+  +-- virtio-net driver (DMA ring buffers)
+  +-- smoltcp TCP/UDP/DHCP stack
+  +-- DNS resolver (RFC 1035, 8-entry cache)
+  +-- TLS 1.3 (embedded-tls, AES-128-GCM, P-256)
+  +-- RDRAND-based CryptoRng
+  +-- DER parser + SPKI pin infrastructure
+  +-- HTTP request builder (Messages API)
+  +-- SSE streaming parser (text_delta + tool_use)
+  +-- JSON parser (recursive descent, no_std)
+  +-- Retry with exponential backoff + Retry-After
+  +-- ask/askp shell commands
 
-Phase 5: WASM Agents                       [Weeks 25-28]
-  ├── wasmi integration
-  ├── Host function ABI
-  ├── Agent lifecycle (load/start/stop)
-  └── Styx integration for agents
+Phase 5: Agents                            [DONE]
+  +-- Lua 5.5.0 FFI integration
+  +-- Memory-limited allocator (16 MiB default)
+  +-- 9 builtins (sql, read, write, ls, log, sleep, now, audit, ask)
+  +-- 30s execution timeout
+  +-- Read-only SQL enforcement for agents
+  +-- Interactive REPL (full SQL access)
+  +-- Agentic loop (agent/agentp commands)
+  +-- 5 Claude tools (read_file, write_file, sql_query, list_dir, str_replace)
+  +-- Multi-turn conversation with tool_result
+  +-- Up to 20 agentic turns
+
+Phase 6: GPU Driver                        [NOT STARTED]
+  +-- PCI enumeration for GPU
+  +-- BAR0 mapping
+  +-- Command buffer / queue submission
+  +-- DMA: RAM <-> VRAM
+  +-- Inference driver skeleton
 ```
 
 ---
 
-## 12. What This Design Does NOT Cover (Intentionally)
+## 15. What This Design Does NOT Cover (Intentionally)
 
-- **Networking stack**: TCP/IP is a separate subsystem. Styx-over-TCP
-  needs it but the Styx protocol itself is transport-agnostic.
-- **Display / framebuffer**: Not needed for a headless AI server.
-- **USB / keyboard**: Serial console suffices for Phase 1-5.
-- **Multi-user security**: Single-operator system initially.
-- **Redundancy / RAID**: Single NVMe device. Backups are the operator's
-  responsibility.
+- **Local GPU inference**: The AI path goes through the Anthropic API,
+  not local compute. GPU support is deferred to Phase 6.
+- **WASM sandbox**: Replaced by Lua 5.5 for agent scripting. WASM may be
+  revisited if stronger isolation is needed.
+- **Display / framebuffer**: Not needed for a headless system.
+- **USB / keyboard**: Serial console suffices.
+- **Multi-user security**: Single-operator system.
+- **Config persistence**: API key and model are in-memory (lost on reboot).
+  Phase 6 should persist them in the namespace table.
+- **Certificate pinning enforcement**: Infrastructure ready, blocked by
+  embedded-tls 0.18 `pub(crate)` limitation.
 
 ---
 
-## 13. Risks and Open Questions
+## 16. Risks and Open Questions
 
-| Risk                               | Mitigation                                      |
+| Risk                               | Status / Mitigation                             |
 | ---------------------------------- | ----------------------------------------------- |
-| SQLite C code has hidden libc deps | Audit with `nm`; stub missing symbols            |
-| NVMe controller quirks             | Test on 2-3 different NVMe models               |
-| Block allocator fragmentation      | Monitor, add compaction if needed                |
-| WASM interpreter too slow for agents | Profile first; wasm3 fallback; native Rust escape hatch |
-| GPU driver complexity              | Start with one GPU vendor (e.g., simple virtio-gpu for QEMU) |
-| Timer drift without NTP            | Acceptable for non-distributed initial design   |
+| SQLite C code has hidden libc deps | **Resolved**: All stubs in place, builds clean  |
+| NVMe controller quirks             | Tested on QEMU virtio-blk; real hardware TBD    |
+| Block allocator fragmentation      | Monitor; add compaction if needed                |
+| TLS without cert pinning           | SPKI infra ready; waiting on embedded-tls update |
+| API key in memory (not persisted)  | Acceptable for Phase 5; persist in Phase 6       |
+| Lua agents not sandboxed           | Run in kernel space; resource-limited only       |
+| No rate limit on agent command     | 20-turn cap; Lua ask() has 10s rate limit        |
+| UTF-8 in API responses             | **Fixed**: JSON parser handles multi-byte UTF-8  |
+| Model string staleness             | **Fixed**: Updated to claude-sonnet-4-6-20250514 |
 
 ---
 
-*This document is the architecture. The implementation is the next step.*
+## 17. Code Map
+
+```
+kernel/src/
++-- lib.rs                  Module declarations
++-- main.rs                 Boot sequence + shell loop
++-- arch/x86_64/            GDT, PIC, IDT, timer, serial, CPU features
++-- mem/                    Physical page allocator, DMA allocator, heap
++-- drivers/
+|   +-- nvme/               NVMe driver (PCI, queues, commands)
+|   +-- virtio/             virtio-net NIC driver
++-- storage/                Block allocator, file table (on-disk layout)
++-- vfs/                    SQLite VFS bridge (xRead, xWrite, xSync, xShm*)
++-- sqlite/                 SQLite FFI, DB wrapper, VFS registration
++-- fs/styx/                9P2000 message parser, namespace server
++-- net/                    smoltcp stack, DNS resolver
++-- crypto/                 RDRAND RNG, DER parser, SPKI pin verifier
++-- api/
+|   +-- mod.rs              HTTP client, SSE parser, retry logic
+|   +-- http.rs             HTTP response parser
+|   +-- json.rs             Recursive descent JSON parser
+|   +-- tools.rs            Tool definitions (5 tools with JSON Schema)
++-- lua/
+|   +-- mod.rs              Lua 5.5 execution engine
+|   +-- ffi.rs              Raw C FFI bindings
+|   +-- alloc.rs            Memory-limited allocator
+|   +-- builtins.rs         9 builtin functions
+|   +-- repl.rs             Interactive REPL
++-- shell/
+    +-- mod.rs              Shell loop
+    +-- commands.rs         Built-in command dispatch
+    +-- agent.rs            Agentic loop (tool dispatch, conversation)
+    +-- line.rs             Line editor (backspace, Ctrl-C, Ctrl-U)
+```
+
+---
+
+*v1.0 was the architecture. v2.0 is the implementation.*
